@@ -9,6 +9,7 @@
 
 #include <mcube/kernel.h>
 #include <mcube/io.h>
+#include <mcube/mm.h>
 
 #define MCUBE_VERSION "0.1.0"
 #define MCUBE_CODENAME "Genesis"
@@ -113,6 +114,16 @@ void kernel_main(boot_info_t *bi) {
     gdt_init();
     kprintf("[cpu] loading IDT (256 vectors) and remapping PIC...\n");
     idt_init();
+
+    kprintf("[mm] initialising physical allocator...\n");
+    pmm_init(bi);
+    vmm_init(bi);
+    kmalloc_init();
+    pmm_dump_stats();
+    if (mm_selftest() != 0) {
+        panic("memory self test failed");
+    }
+    kmalloc_dump_stats();
 
     ai_subsys_init();
 

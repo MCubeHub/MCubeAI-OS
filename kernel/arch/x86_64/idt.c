@@ -5,6 +5,7 @@
 
 #include <mcube/kernel.h>
 #include <mcube/io.h>
+#include <mcube/mm.h>
 
 #define IDT_ENTRIES 256
 #define IRQ_BASE 0x20
@@ -128,6 +129,10 @@ void idt_init(void) {
 /* Called from isr_common (isr.asm). Never returns for CPU exceptions. */
 void isr_handler(isr_frame_t *f) {
     if (f->vector < 32) {
+        if (f->vector == 14) {
+            u64 cr2 = read_cr2();
+            if (vmm_page_fault(cr2, f->error, f)) return;
+        }
         const char *name = g_exception_names[f->vector];
         kprintf("\n!!! CPU exception %u: %s\n", (u32)f->vector, name);
         kprintf("    rip=%p cs=%x rflags=%p error=%p\n",
