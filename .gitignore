@@ -1,0 +1,12 @@
+build/
+*.o
+*.d
+*.elf
+*.EFI
+*.img
+*.log
+*.ppm
+*.png
+!assets/**/*.png
+.cache/
+compile_commands.json
