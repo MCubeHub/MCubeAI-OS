@@ -3,6 +3,8 @@
 
 #include <mcube/types.h>
 #include <mcube/bootinfo.h>
+#include <mcube/fb.h>
+#include <mcube/input.h>
 
 /* lib/string.c */
 void *memcpy(void *dst, const void *src, usize n);
@@ -33,6 +35,8 @@ void fb_init(const boot_info_t *bi);
 void fb_clear(void);
 void fb_putc(char c);
 void fb_write(const char *s);
+int  fb_get_info(mcube_fb_info_t *out);
+void fb_console_disable(void);
 
 /* console multiplexer (serial + framebuffer) */
 void console_init(const boot_info_t *bi);

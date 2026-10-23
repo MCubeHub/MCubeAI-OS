@@ -554,13 +554,38 @@ static int copy_user_vec(char **kvec, int max, char *buf, usize cap, u64 uvec) {
     return n;
 }
 
-static long sys_execve(u64 upath, u64 uargv, u64 uenvp, syscall_frame_t *f) {
+/* Load an ELF and build a fresh address space + argument stack. Shared by
+ * execve() and spawn() so both use exactly the same validation rules. */
+typedef struct exec_req {
+    u8 *image;
+    char *argbuf;
+    char *envbuf;
+    char *kargv[EXEC_MAX_VEC + 1];
+    char *kenvp[EXEC_MAX_VEC + 1];
+    u64 image_size;
+    u64 entry;
+    u64 rsp;
+    u64 new_as;
     char path[VFS_PATH_MAX];
-    int rc = make_path(path, upath);
+} exec_req_t;
+
+static void exec_req_free(exec_req_t *r) {
+    kfree(r->image);
+    kfree(r->argbuf);
+    kfree(r->envbuf);
+    r->image = NULL;
+    r->argbuf = NULL;
+    r->envbuf = NULL;
+}
+
+static int exec_req_load(exec_req_t *r, u64 upath, u64 uargv, u64 uenvp) {
+    memset(r, 0, sizeof(*r));
+
+    int rc = make_path(r->path, upath);
     if (rc != 0) return rc;
 
     vfs_file_t *vf = NULL;
-    rc = vfs_open(path, VFS_O_RDONLY, &vf);
+    rc = vfs_open(r->path, VFS_O_RDONLY, &vf);
     if (rc != 0) return rc;
 
     vfs_stat_t st;
@@ -571,63 +596,118 @@ static long sys_execve(u64 upath, u64 uargv, u64 uenvp, syscall_frame_t *f) {
         return -EINVAL;
     }
 
-    u8 *image = kmalloc(st.size);
-    char *argbuf = kmalloc(2048);
-    char *envbuf = kmalloc(2048);
-    char *kargv[EXEC_MAX_VEC + 1];
-    char *kenvp[EXEC_MAX_VEC + 1];
-    if (!image || !argbuf || !envbuf) {
-        kfree(image); kfree(argbuf); kfree(envbuf);
+    r->image = kmalloc(st.size);
+    r->argbuf = kmalloc(2048);
+    r->envbuf = kmalloc(2048);
+    if (!r->image || !r->argbuf || !r->envbuf) {
+        exec_req_free(r);
         vfs_close(vf);
         return -ENOMEM;
     }
 
     u64 done = 0;
     while (done < st.size) {
-        long n = vfs_read(vf, image + done, st.size - done);
+        long n = vfs_read(vf, r->image + done, st.size - done);
         if (n <= 0) break;
         done += (u64)n;
     }
     vfs_close(vf);
     if (done != st.size) {
-        kfree(image); kfree(argbuf); kfree(envbuf);
+        exec_req_free(r);
         return -EIO;
     }
+    r->image_size = st.size;
 
-    rc = copy_user_vec(kargv, EXEC_MAX_VEC, argbuf, 2048, uargv);
-    if (rc < 0) goto out;
+    rc = copy_user_vec(r->kargv, EXEC_MAX_VEC, r->argbuf, 2048, uargv);
+    if (rc < 0) goto fail;
     if (rc == 0) {
-        kargv[0] = path;
-        kargv[1] = NULL;
+        r->kargv[0] = r->path;
+        r->kargv[1] = NULL;
     }
-    rc = copy_user_vec(kenvp, EXEC_MAX_VEC, envbuf, 2048, uenvp);
-    if (rc < 0) goto out;
+    rc = copy_user_vec(r->kenvp, EXEC_MAX_VEC, r->envbuf, 2048, uenvp);
+    if (rc < 0) goto fail;
 
-    u64 entry = 0, rsp = 0, new_as = 0;
-    rc = user_exec(image, st.size, kargv, kenvp, &entry, &rsp, &new_as);
-    if (rc != 0) goto out;
+    rc = user_exec(r->image, st.size, r->kargv, r->kenvp,
+                   &r->entry, &r->rsp, &r->new_as);
+    if (rc != 0) goto fail;
+    return 0;
+
+fail:
+    exec_req_free(r);
+    return rc;
+}
+
+static long sys_execve(u64 upath, u64 uargv, u64 uenvp, syscall_frame_t *f) {
+    exec_req_t r;
+    int rc = exec_req_load(&r, upath, uargv, uenvp);
+    if (rc != 0) return rc;
 
     task_t *t = current_task();
     u64 old_as = t->pml4_phys;
 
-    t->pml4_phys = new_as;
-    t->user_entry = entry;
+    t->pml4_phys = r.new_as;
+    t->user_entry = r.entry;
     t->user_stack_top = USER_STACK_TOP;
     t->brk = user_brk_default();
     t->brk_end = user_brk_default();
-    write_cr3(new_as);
+    write_cr3(r.new_as);
 
-    f->user_rip = entry;
-    f->user_rsp = rsp;
+    f->user_rip = r.entry;
+    f->user_rsp = r.rsp;
 
     if (old_as) user_as_destroy(old_as);
-    rc = 0;
+    exec_req_free(&r);
+    return 0;
+}
 
-out:
-    kfree(image);
-    kfree(argbuf);
-    kfree(envbuf);
-    return rc;
+/* spawn(): load an ELF into a brand-new address space and install two
+ * descriptors as fd 3/4. This is how the desktop starts applications without
+ * copying its (potentially large) heap the way fork() would. */
+static long sys_spawn(u64 upath, u64 uargv, u64 uenvp, u64 ufds) {
+    exec_req_t r;
+    int rc = exec_req_load(&r, upath, uargv, uenvp);
+    if (rc != 0) return rc;
+
+    task_t *parent = current_task();
+    const char *name = r.path;
+    for (const char *p = r.path; *p; p++) {
+        if (*p == '/') name = p + 1;
+    }
+
+    task_t *child = task_create_user(name, r.entry, r.rsp, r.new_as);
+    if (!child) {
+        user_as_destroy(r.new_as);
+        exec_req_free(&r);
+        return -ENOMEM;
+    }
+
+    child->ppid = parent ? parent->pid : 0;
+    child->brk = user_brk_default();
+    child->brk_end = user_brk_default();
+    if (parent) memcpy(child->cwd, parent->cwd, sizeof(child->cwd));
+
+    int fds[2] = { -1, -1 };
+    if (ufds && parent &&
+        copy_from_user(fds, (const void *)(uptr)ufds, sizeof(fds)) == 0) {
+        for (int k = 0; k < 2; k++) {
+            int src = fds[k];
+            int dst = 3 + k;
+            if (src < 0 || src >= VFS_MAX_FDS) continue;
+            if (parent->files[src]) {
+                parent->files[src]->refs++;
+                child->files[dst] = parent->files[src];
+            } else if (parent->socks[src]) {
+                net_socket_ref(parent->socks[src]);
+                child->socks[dst] = parent->socks[src];
+            } else if (parent->pipes[src]) {
+                pipe_end_ref(parent->pipes[src]);
+                child->pipes[dst] = parent->pipes[src];
+            }
+        }
+    }
+
+    exec_req_free(&r);
+    return (long)child->pid;
 }
 
 static long sys_wait4(int pid, u64 ustatus, int options) {
@@ -738,6 +818,125 @@ static long sys_dup2(int oldfd, int newfd) {
     return newfd;
 }
 
+/* ---- M8: framebuffer, input, poll, time, task info ----------------- */
+
+static long sys_fb_info(u64 uinfo) {
+    mcube_fb_info_t info;
+    int rc = fb_get_info(&info);
+    if (rc != 0) return rc;
+    if (copy_to_user((void *)(uptr)uinfo, &info, sizeof(info)) != 0) {
+        return -EFAULT;
+    }
+    return 0;
+}
+
+static long sys_fb_map(void) {
+    task_t *t = current_task();
+    if (!t || !t->pml4_phys) return -ESRCH;
+
+    mcube_fb_info_t info;
+    int rc = fb_get_info(&info);
+    if (rc != 0) return rc;
+
+    u64 size = ALIGN_UP(info.size, PAGE_SIZE);
+    for (u64 off = 0; off < size; off += PAGE_SIZE) {
+        rc = user_map(t->pml4_phys, MCUBE_FB_USER_BASE + off,
+                      info.phys + off, PTE_WRITE | PTE_PCD | PTE_NX | PTE_SHARED);
+        if (rc != 0) return rc;
+    }
+
+    /* The display server owns the screen from now on: keep kernel messages on
+     * the serial console so they cannot corrupt the desktop. */
+    fb_console_disable();
+    input_mouse_bounds(info.width, info.height);
+    return (long)MCUBE_FB_USER_BASE;
+}
+
+static long sys_input_poll(u64 uev) {
+    input_event_t ev;
+    if (!input_pop(&ev)) return 0;
+    if (copy_to_user((void *)(uptr)uev, &ev, sizeof(ev)) != 0) return -EFAULT;
+    return 1;
+}
+
+static int poll_fd_ready(task_t *t, int fd, short events) {
+    if (!t || fd < 0) return 0;
+    if (!(events & MCUBE_POLLIN)) return 0;
+
+    if (fd < VFS_MAX_FDS) {
+        if (t->pipes[fd]) return pipe_readable(t->pipes[fd]);
+        if (t->socks[fd]) return net_socket_readable(t->socks[fd]);
+        if (t->files[fd]) return 1;
+    }
+    if (fd == 0) return tty_pending();
+    return 0;
+}
+
+#define POLL_MAX_FDS 64
+
+static long sys_poll(u64 upfds, u64 nfds, i64 timeout_ms) {
+    task_t *t = current_task();
+    if (!t || !upfds || nfds == 0 || nfds > POLL_MAX_FDS) return -EINVAL;
+
+    mcube_pollfd_t fds[POLL_MAX_FDS];
+    if (copy_from_user(fds, (const void *)(uptr)upfds,
+                       nfds * sizeof(mcube_pollfd_t)) != 0) {
+        return -EFAULT;
+    }
+
+    for (;;) {
+        int ready = 0;
+        for (u64 i = 0; i < nfds; i++) {
+            fds[i].revents = 0;
+            if (poll_fd_ready(t, fds[i].fd, fds[i].events)) {
+                fds[i].revents = MCUBE_POLLIN;
+                ready++;
+            }
+        }
+        if (ready > 0 || timeout_ms == 0) {
+            if (copy_to_user((void *)(uptr)upfds, fds,
+                             nfds * sizeof(mcube_pollfd_t)) != 0) {
+                return -EFAULT;
+            }
+            return ready;
+        }
+        task_sleep_ms(1);
+        if (timeout_ms > 0) timeout_ms--;
+    }
+}
+
+static long sys_time(u64 utime) {
+    mcube_time_t ts;
+    ts.uptime_ms = timer_uptime_ms();
+    ts.epoch = timer_boot_time_unix();
+    ts.ticks = timer_ticks();
+    if (copy_to_user((void *)(uptr)utime, &ts, sizeof(ts)) != 0) return -EFAULT;
+    return 0;
+}
+
+#define TASKINFO_MAX 64
+
+static long sys_taskinfo(u64 ubuf, u64 max) {
+    if (!ubuf || max == 0) return -EINVAL;
+    if (max > TASKINFO_MAX) max = TASKINFO_MAX;
+
+    mcube_task_info_t *tmp = kmalloc((usize)(max * sizeof(*tmp)));
+    if (!tmp) return -ENOMEM;
+    u32 n = task_snapshot(tmp, (u32)max);
+    int rc = 0;
+    if (n && copy_to_user((void *)(uptr)ubuf, tmp,
+                          (u64)n * sizeof(*tmp)) != 0) {
+        rc = -EFAULT;
+    }
+    kfree(tmp);
+    return rc != 0 ? rc : (long)n;
+}
+
+static long sys_kill(u32 pid, int sig) {
+    if (sig != MCUBE_SIGTERM && sig != 9) return -EINVAL;
+    return task_kill(pid, 128 + sig);
+}
+
 void syscall_handler(syscall_frame_t *f) {
     task_t *t = current_task();
     if (t) t->syscalls++;
@@ -828,6 +1027,9 @@ void syscall_handler(syscall_frame_t *f) {
     case SYS_EXECVE:
         ret = sys_execve(f->rdi, f->rsi, f->rdx, f);
         break;
+    case SYS_SPAWN:
+        ret = sys_spawn(f->rdi, f->rsi, f->rdx, f->r10);
+        break;
     case SYS_WAIT4:
         ret = sys_wait4((int)f->rdi, f->rsi, (int)f->rdx);
         break;
@@ -853,7 +1055,25 @@ void syscall_handler(syscall_frame_t *f) {
         ret = sys_unlink(f->rdi);
         break;
     case SYS_KILL:
-        ret = -ENOSYS;
+        ret = sys_kill((u32)f->rdi, (int)f->rsi);
+        break;
+    case SYS_FB_INFO:
+        ret = sys_fb_info(f->rdi);
+        break;
+    case SYS_FB_MAP:
+        ret = sys_fb_map();
+        break;
+    case SYS_INPUT_POLL:
+        ret = sys_input_poll(f->rdi);
+        break;
+    case SYS_POLL:
+        ret = sys_poll(f->rdi, f->rsi, (i64)f->rdx);
+        break;
+    case SYS_TIME:
+        ret = sys_time(f->rdi);
+        break;
+    case SYS_TASKINFO:
+        ret = sys_taskinfo(f->rdi, f->rsi);
         break;
     default:
         if (f->nr >= SYS_AI_BASE && f->nr <= SYS_AI_LAST) {

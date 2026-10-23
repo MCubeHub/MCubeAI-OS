@@ -105,6 +105,48 @@ pid_t waitpid(pid_t pid, int *status, int options) {
 
 void sleep_ms(u64 ms) { sys1(SYS_NANOSLEEP, (long)ms); }
 
+int kill(pid_t pid, int sig) { return fail(sys2(SYS_KILL, pid, sig)); }
+
+/* ---- graphics / desktop (M8) --------------------------------------- */
+
+int fb_info(mcube_fb_info_t *info) {
+    return fail(sys1(SYS_FB_INFO, (long)info));
+}
+
+void *fb_map(void) {
+    long rc = sys0(SYS_FB_MAP);
+    if (rc < 0) {
+        errno = (int)-rc;
+        return NULL;
+    }
+    return (void *)(uptr)rc;
+}
+
+int input_poll(input_event_t *ev) {
+    long rc = sys1(SYS_INPUT_POLL, (long)ev);
+    if (rc < 0) {
+        errno = (int)-rc;
+        return -1;
+    }
+    return (int)rc;
+}
+
+int poll(mcube_pollfd_t *fds, int nfds, int timeout_ms) {
+    return fail(sys3(SYS_POLL, (long)fds, nfds, timeout_ms));
+}
+
+int mc_time(mcube_time_t *ts) { return fail(sys1(SYS_TIME, (long)ts)); }
+
+int taskinfo(mcube_task_info_t *buf, int max) {
+    return fail(sys2(SYS_TASKINFO, (long)buf, max));
+}
+
+pid_t spawn(const char *path, char *const argv[], int cmd_fd, int evt_fd) {
+    int fds[2] = { cmd_fd, evt_fd };
+    return (pid_t)fail(__syscall6(SYS_SPAWN, (long)path, (long)argv, 0,
+                                  (long)fds, 0, 0));
+}
+
 void *brk(void *addr) {
     long rc = sys1(SYS_BRK, (long)addr);
     if (rc < 0) {

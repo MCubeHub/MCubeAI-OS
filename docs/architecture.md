@@ -8,7 +8,7 @@
 │ AI 客户端 / CLI      chat-ui  ai  ?命令                       │
 ├──────────────────────────────────────────────────────────────┤
 │ 用户态服务           aiosd: 推理线程池 上下文 记忆 工具 审计    │
-│                     displayd: 合成器    netd: DHCP/DNS(可选)   │
+│                     desktop: 合成器/窗口管理/输入路由          │
 ├──────────────────────────────────────────────────────────────┤
 │ libc / libui / libai  POSIX 子集 + 原生 AI 客户端库            │
 ├──────────────────────────────────────────────────────────────┤
@@ -92,7 +92,7 @@
 - M5 已落地：`read/write/open/close/stat/fstat/getdents64/mkdir/unlink`
   （号段与 Linux x86_64 对齐）。`mcube_stat_t` 与 `mcube_dirent_t`
   是固定大小的共享 ABI 结构，内核侧对应 `vfs_stat_t`/`vfs_dirent_t`。
-- 文件描述符 0/1/2 默认连接到控制台；3..15 由每任务 fd 表分配。
+- 文件描述符 0/1/2 默认连接到控制台；3..31 由每任务 fd 表分配。
   `read(0)` 从 TTY 环形队列取数据，空队列返回 `-EAGAIN`。
 - M6 已落地：`socket(41)/connect(42)/sendto(44)/recvfrom(45)/bind(49)`。
   socket 与文件共用 fd 空间：`task_t->files[]` 存 VFS 句柄，
@@ -113,8 +113,24 @@
     `2>&1` 均可用。
   - 管道为 4 KiB 环形缓冲；读空/写满时任务睡眠，写端全部关闭后读端
     返回 0，读端全部关闭后写端返回 `-EPIPE`。
-  - `brk` 在 `0x0100_0000`–`0x0200_0000` 之间按页映射堆；用户态
+  - `brk` 在 `0x0100_0000`–`0x1000_0000` 之间按页映射堆；用户态
     `malloc` 是建立在 `brk` 上的 bump 分配器（`free` 暂为空操作）。
+- M8 已落地：`fb_info(0x100)/fb_map(0x101)/input_poll(0x102)/poll(0x103)/
+  time(0x104)/taskinfo(0x105)/spawn(0x106)`。
+  - `fb_map` 把 GOP 帧缓冲物理页映射到用户 VA `0x3000_0000`，PTE 带
+    `PCD`（不做缓存合并）与软件位 `PTE_SHARED`；`user_as_destroy()` 与
+    `user_as_clone()` 跳过该位，避免把 MMIO 当作匿名页释放或复制。
+    映射成功后调用 `fb_console_disable()`，内核日志留在串口。
+  - 键盘 IRQ1 与鼠标 IRQ12 都向 `input_event_t` 环形队列投递原始事件，
+    TTY 仍保留自己的行缓冲；`input_poll` 每次返回一个事件，鼠标绝对
+    坐标由内核按 GOP 尺寸钳制。
+  - `poll` 支持 pipe、socket、TTY 与普通文件，超时以 1 ms 为粒度睡眠，
+    是桌面主循环与应用 `gui_wait()` 的基础。
+  - `spawn(path, argv, envp, fds[2])` 装载 ELF 到新地址空间，并把父进程
+    的 `fds[0]/fds[1]` 引用复制到子进程 fd 3/4；不复制父进程堆，桌面
+    用它在 O(1) 内存开销下启动应用。
+  - `taskinfo` 在关中断下遍历任务链表快照 pid/ppid/state/ticks/
+    switches/syscalls/name，`kill` 目前只接受 SIGTERM/SIGKILL。
 
 ## 6. 文件系统与设备模型
 
@@ -139,7 +155,25 @@
   `execve`；内建命令在 shell 进程内执行，重定向通过临时 `dup2` 到
   0/1 并在结束后恢复 `/dev/console`。
 
-## 7. AI 原生层接口
+## 7. 图形与桌面（M8）
+
+- 所有权：桌面（`desktop.elf`）是唯一映射 framebuffer 的进程，应用永远
+  不直接写像素。光标、菜单、焦点、裁剪和 Z 序因此只有一个实现，应用
+  崩溃也不会破坏屏幕。
+- 通道：桌面为每个窗口调用两次 `pipe()`，`spawn()` 时把命令写端与事件
+  读端安装为子进程的 fd 3/4。命令与事件都是定长结构，双方一次
+  `read/write` 处理一条消息，不需要额外分帧。
+- 合成：应用用 `CLEAR/FILL/RECT/TEXT` 在桌面分配的离屏 surface 上绘制，
+  `FLUSH` 后桌面把 surface blit 到 framebuffer。平铺布局变化时桌面推送
+  `RESIZE`，客户端在 `gui_wait()` 中同步缓存宽高；终端据此重排字符网格。
+- 输入：桌面轮询 `SYS_INPUT_POLL`，按窗口矩形与焦点路由 `KEY`/`MOUSE`；
+  F1 打开开始菜单，F9 切换焦点，菜单内方向键 + 回车启动应用。
+- 生命周期：桌面用 `SYS_SPAWN` 启动应用，不复制自己的地址空间；关闭
+  窗口时关闭两条管道并 `kill`/`waitpid` 子进程。
+- 绘制原语刻意保持最小：实心矩形、1 像素边框、8×16 位图文本。窗口
+  背景/控件都由这些原语组合，避免了在内核或用户态引入完整 2D 引擎。
+
+## 8. AI 原生层接口
 
 ```
 应用/CLI ──Unix socket(JSON/CBOR)──> aiosd ──ai_* syscall──> kernel
@@ -158,7 +192,7 @@
 - 审计：每次工具调用写入 `journal`，包含 agent uid、工具名、参数摘要、
   结果状态、用户授权记录；支持撤销授权。
 
-## 8. 安全模型
+## 9. 安全模型
 
 - 内核/用户隔离、SMEP/SMAP、W^X、栈保护、`copy_*_user` 边界检查。
 - AI Agent 使用独立 UID + 能力集（capability bits），默认只能读自己的目录。
@@ -167,7 +201,7 @@
 - 沙箱执行：`ai-sandbox` 子进程，seccomp 风格系统调用白名单 + 路径白名单。
 - 提示注入：工具返回值标记为不可信内容，模型侧包裹隔离标记，UI 上单独展示。
 
-## 9. 构建与验证
+## 10. 构建与验证
 
 - 交叉/原生工具链：`gcc` + `nasm` + `x86_64-w64-mingw32-gcc`（UEFI PE）。
 - 内核链接地址 2 MiB（M1）→ higher-half（M2）；保留 `.symtab` 供 gdb。

@@ -584,6 +584,12 @@ int net_socket_recv(struct net_socket *s, void *buf, u64 len) {
     return net_socket_recvfrom(s, buf, len, NULL, NULL);
 }
 
+int net_socket_readable(struct net_socket *s) {
+    if (!s) return 0;
+    net_poll();
+    return s->rx_ready != 0;
+}
+
 void net_task_cleanup(struct task *t) {
     task_t *task = (task_t *)t;
     if (!task) return;

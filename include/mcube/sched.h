@@ -4,6 +4,7 @@
 #include <mcube/types.h>
 #include <mcube/timer.h>
 #include <mcube/vfs.h>
+#include <mcube/syscall.h>
 
 enum task_state {
     TASK_READY = 0,
@@ -57,6 +58,8 @@ task_t *task_create_user_fork(const char *name, const struct syscall_frame *f,
                               u64 pml4_phys);
 void task_set_exit_status(int status);
 int  task_wait(u32 pid, int *status);
+int  task_kill(u32 pid, int status);
+u32  task_snapshot(mcube_task_info_t *out, u32 max);
 void schedule(void);
 void sched_tick(void);
 int  sched_need_resched(void);

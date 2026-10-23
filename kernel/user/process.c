@@ -111,7 +111,9 @@ void user_as_destroy(u64 pml4_phys) {
                 u64 *pt = table_ptr(pd[k] & PTE_ADDR_MASK);
                 for (u32 l = 0; l < 512; l++) {
                     if (pt[l] & PTE_PRESENT) {
-                        pmm_free_page(pt[l] & PTE_ADDR_MASK);
+                        if (!(pt[l] & PTE_SHARED)) {
+                            pmm_free_page(pt[l] & PTE_ADDR_MASK);
+                        }
                     }
                 }
                 pmm_free_page(pd[k] & PTE_ADDR_MASK); /* PT */
@@ -219,6 +221,12 @@ static int clone_table(u64 *src, u64 *dst, int level) {
         u64 phys = e & PTE_ADDR_MASK;
         if (level == 1) {
             if (e & PTE_HUGE) return -EINVAL;
+            if (e & PTE_SHARED) {
+                /* Device/shared mapping (framebuffer): both address spaces
+                 * point at the same physical range; neither owns it. */
+                dst[i] = e;
+                continue;
+            }
             u64 pa = pmm_alloc_page();
             if (!pa) return -ENOMEM;
             memcpy(phys_to_virt(pa), phys_to_virt(phys), PAGE_SIZE);
@@ -388,7 +396,7 @@ fail:
 /* ---- program break (brk) ------------------------------------------- */
 
 #define USER_HEAP_BASE 0x0000000001000000ULL   /* 16 MiB */
-#define USER_HEAP_LIMIT 0x0000000002000000ULL  /* 16 MiB of heap */
+#define USER_HEAP_LIMIT 0x0000000010000000ULL  /* grow up to 256 MiB */
 
 u64 user_brk_default(void) { return USER_HEAP_BASE; }
 

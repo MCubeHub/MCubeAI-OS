@@ -175,6 +175,7 @@ void kernel_main(boot_info_t *bi) {
     block_init();
     block_dump();
     tty_init();
+    input_init();
     if (vfs_init() == 0) {
         vfs_selftest();
     } else {

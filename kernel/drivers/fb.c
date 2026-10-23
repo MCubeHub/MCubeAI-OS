@@ -3,6 +3,7 @@
 #include <mcube/kernel.h>
 #include <mcube/io.h>
 #include <mcube/mm.h>
+#include <mcube/syscall.h>
 
 #define FONT_W 8
 #define FONT_H 16
@@ -13,12 +14,15 @@ extern const u8 mc_font8x16[256][FONT_H];
 
 static struct {
     u8 *base;
+    u64 phys;
+    u64 size;
     u32 width, height, pitch;
     u32 format;
     u32 fg, bg;
     u32 cols, rows;
     u32 cx, cy;
     int ready;
+    int console_on;
 } g_fb;
 
 static u32 rgb_to_pixel(u8 r, u8 g, u8 b) {
@@ -59,9 +63,11 @@ void fb_init(const boot_info_t *bi) {
     if (!bi || !bi->fb_base || bi->fb_width == 0 || bi->fb_height == 0) return;
 
     g_fb.base = (u8 *)phys_to_virt(bi->fb_base);
+    g_fb.phys = bi->fb_base;
     g_fb.width = bi->fb_width;
     g_fb.height = bi->fb_height;
     g_fb.pitch = bi->fb_pitch ? bi->fb_pitch : bi->fb_width * 4;
+    g_fb.size = ALIGN_UP((u64)g_fb.pitch * g_fb.height, 4096);
     g_fb.format = bi->fb_format;
     g_fb.fg = rgb_to_pixel(0xE6, 0xE9, 0xF0);
     g_fb.bg = rgb_to_pixel(0x0B, 0x0D, 0x14);
@@ -69,6 +75,7 @@ void fb_init(const boot_info_t *bi) {
     g_fb.rows = g_fb.height / FONT_H;
     g_fb.cx = g_fb.cy = 0;
     g_fb.ready = 1;
+    g_fb.console_on = 1;
     fb_clear();
 }
 
@@ -92,7 +99,7 @@ static void draw_glyph(u32 cx, u32 cy, u8 ch) {
 }
 
 void fb_putc(char c) {
-    if (!g_fb.ready) return;
+    if (!g_fb.ready || !g_fb.console_on) return;
 
     switch (c) {
     case '\n':
@@ -127,6 +134,7 @@ void fb_putc(char c) {
 }
 
 void fb_write(const char *s) {
+    if (!g_fb.ready || !g_fb.console_on) return;
     while (*s) fb_putc(*s++);
 }
 
@@ -139,4 +147,21 @@ void fb_get_size(u32 *cols, u32 *rows) {
 void fb_fill_rect(u32 x, u32 y, u32 w, u32 h, u32 rgb) {
     if (!g_fb.ready) return;
     fill_rect(x, y, w, h, rgb_to_pixel((u8)(rgb >> 16), (u8)(rgb >> 8), (u8)rgb));
+}
+
+int fb_get_info(mcube_fb_info_t *out) {
+    if (!out || !g_fb.ready) return -ENODEV;
+    out->phys = g_fb.phys;
+    out->size = g_fb.size;
+    out->width = g_fb.width;
+    out->height = g_fb.height;
+    out->pitch = g_fb.pitch;
+    out->format = g_fb.format;
+    out->bpp = 32;
+    out->reserved = 0;
+    return 0;
+}
+
+void fb_console_disable(void) {
+    g_fb.console_on = 0;
 }

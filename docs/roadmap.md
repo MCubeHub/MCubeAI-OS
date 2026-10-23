@@ -124,15 +124,43 @@
   `echo hello-pipe | wc -c`。`make test` 断言 `USER_SHELL_OK` 与
   `USER_REDIR_OK`。
 
-## M8 — 图形子系统与桌面
+## M8 — 图形子系统与桌面（已完成）
 
 对应清单：四.4–四.6。
 
-- GOP 双缓冲、图形基元、位图/TTF 子集字体（中英文）、事件队列。
-- 窗口管理器、合成器、libui 控件、任务栏/开始菜单/登录界面。
-- 文件管理器、终端、编辑器、计算器、图片查看器、设置、任务管理器。
-- 验收：QEMU 截图中可见桌面；窗口可拖动/缩放/最小化；
-  终端内运行 Shell；文件管理器可以浏览 FAT32 分区。
+- 已实现：
+  - 帧缓冲：`SYS_FB_INFO` 读取 GOP 模式（1280×800 BGRA，pitch 5120），
+    `SYS_FB_MAP` 把物理帧缓冲映射到用户 VA `0x3000_0000`（`PTE_PCD`，
+    软件位 `PTE_SHARED` 防止 fork/退出误释放 MMIO），随后关闭内核
+    帧缓冲控制台，日志只走串口。
+  - 输入：PS/2 键盘 IRQ1 与鼠标 IRQ12 汇入 256 项环形事件队列，
+    `SYS_INPUT_POLL` 读取；方向键/Delete/Home/End/PgUp/PgDn/F1–F12
+    使用 `0x100` 以上的键码，鼠标 3 字节包解析并钳制到屏幕范围。
+  - 桌面协议（`include/mcube/gui.h`）：应用不接触 framebuffer。每个窗口
+    由桌面创建两条管道并作为 fd 3（命令）/fd 4（事件）交给应用；
+    `gui_cmd_t`（INIT/CLEAR/FILL/RECT/TEXT/FLUSH/TITLE/CLOSE/LAUNCH/KILL）
+    与 `gui_event_t`（RESIZE/KEY/MOUSE/FOCUS/CLOSE/TICK）均为定长结构。
+  - 合成器（`user/programs/desktop.c`）：独占 framebuffer，为每个窗口
+    维护离屏 surface，负责裁剪、Z 序、标题栏/关闭按钮、平铺布局、
+    任务栏、开始菜单、时钟与鼠标光标保存/恢复；输入按焦点路由。
+  - `SYS_SPAWN`：内核把 ELF 装入全新地址空间并把父进程的两个 fd 安装为
+    子进程 fd 3/4，桌面因此不必 fork 自己的大堆；`SYS_POLL` 提供
+    pipe/socket/tty/普通文件的可读等待，`SYS_TIME`/`SYS_TASKINFO`
+    供任务栏与任务管理器使用，`SYS_KILL` 由桌面代应用终止进程。
+  - 应用：Terminal（fork `/bin/sh.elf` + 双管道、字符网格、按窗口宽度
+    重排）、Files（FAT32 目录浏览、大小显示、启动编辑器）、Editor
+    （16 KiB 缓冲、光标/滚动、F2 保存）、Calculator（整数表达式解析、
+    鼠标/键盘）、Image Viewer（程序化风景、双调色板）、Settings
+    （帧缓冲/时间/任务信息、主题、快捷启动）、Task Manager（进程列表、
+    选择、End Task）。
+  - PID 1 完成既有自检后 fork/exec `/bin/desktop.elf`，父进程继续
+    `execv("/bin/sh.elf")` 保留串口控制台。
+- 待实现：窗口拖动/缩放/最小化、登录界面、中文位图/TTF 字体子集、
+  剪贴板、libui 控件库、应用间共享内存与拖放。
+- 验收：`make test` 断言 `USER_DESKTOP_OK` 与 `USER_GUI_OK`（7 个窗口
+  全部 INIT+FLUSH）；`make screenshot` 截图可见桌面、任务栏、菜单与
+  7 个应用；`make gui-test` 通过 QEMU monitor 发送 F1/方向键/回车与
+  PS/2 鼠标点击，验证菜单导航、应用启动与焦点切换。
 
 ## M9 — AI 原生层
 

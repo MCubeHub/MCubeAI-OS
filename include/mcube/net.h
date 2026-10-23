@@ -59,4 +59,5 @@ int  net_socket_sendto(struct net_socket *s, const void *buf, u64 len,
 int  net_socket_recv(struct net_socket *s, void *buf, u64 len);
 int  net_socket_recvfrom(struct net_socket *s, void *buf, u64 len,
                          u32 *ip, u16 *port);
+int  net_socket_readable(struct net_socket *s);
 void net_task_cleanup(struct task *t);

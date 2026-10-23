@@ -161,6 +161,16 @@ int main(int argc, char **argv, char **envp) {
     sleep_ms(40);
     printf("USER_INIT_OK\n");
 
+    /* Start the desktop in the background. The serial console stays with the
+     * shell below, which keeps automated tests interactive. */
+    pid_t dpid = fork();
+    if (dpid == 0) {
+        static char *desk_argv[] = { "desktop", NULL };
+        execv("/bin/desktop.elf", desk_argv);
+        printf("USER_DESKTOP_EXEC_FAIL\n");
+        _exit(127);
+    }
+
     /* Hand the console to an interactive shell. */
     static char *sh_argv[] = { "sh", NULL };
     execv("/bin/sh.elf", sh_argv);

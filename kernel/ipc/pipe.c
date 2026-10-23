@@ -114,6 +114,12 @@ long pipe_write(pipe_end_t *e, const void *buf, u64 len) {
     return (long)done;
 }
 
+int pipe_readable(pipe_end_t *e) {
+    if (!e || e->write) return 0;
+    pipe_buf_t *p = e->buf;
+    return p->count > 0 || p->writers == 0;
+}
+
 void pipe_task_cleanup(struct task *t) {
     task_t *task = (task_t *)t;
     if (!task) return;

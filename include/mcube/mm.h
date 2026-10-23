@@ -36,6 +36,7 @@ void pmm_dump_stats(void);
 #define PTE_DIRTY    (1ULL << 6)
 #define PTE_HUGE     (1ULL << 7)
 #define PTE_GLOBAL   (1ULL << 8)
+#define PTE_SHARED   (1ULL << 9)   /* software: mapping is not owned by the AS */
 #define PTE_NX       (1ULL << 63)
 
 void vmm_init(const boot_info_t *bi);

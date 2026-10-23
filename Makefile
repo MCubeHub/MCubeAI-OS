@@ -25,7 +25,7 @@ QEMU_MEM        ?= 512M
 QEMU_CPUS       ?= 1
 QEMU_ACCEL      ?= tcg
 QEMU_NET        ?= -netdev user,id=net0 -device e1000,netdev=net0
-RUN_TIMEOUT     ?= 20
+RUN_TIMEOUT     ?= 90
 
 OVMF_CODE       ?= /usr/share/OVMF/OVMF_CODE_4M.fd
 OVMF_VARS       ?= /usr/share/OVMF/OVMF_VARS_4M.fd
@@ -68,7 +68,8 @@ USER_LIB_OBJS   := $(patsubst %.c,$(BUILD)/%.o,$(USER_LIB_C_SRCS)) \
                    $(patsubst %.asm,$(BUILD)/%.o,$(USER_LIB_S_SRCS))
 
 USER_PROGS      := sh ls cat echo mkdir rm cp mv pwd sleep wc grep head tail \
-                   uname true false clear env help
+                   uname true false clear env help \
+                   desktop terminal files editor calc image settings taskman
 USER_PROG_OBJS  := $(addprefix $(BUILD)/user/bin/,$(addsuffix .o,$(USER_PROGS)))
 USER_PROG_ELFS  := $(addprefix $(BUILD)/user/bin/,$(addsuffix .elf,$(USER_PROGS)))
 
@@ -81,7 +82,7 @@ KERNEL_ELF      := $(BUILD)/kernel.elf
 BOOT_EFI        := $(BUILD)/BOOTX64.EFI
 SERIAL_LOG      := $(BUILD)/serial.log
 
-.PHONY: all kernel image run run-gui debug test clean font check-env
+.PHONY: all kernel image run run-gui debug test screenshot gui-test clean font check-env
 
 # Keep per-program objects between builds instead of treating them as
 # intermediate files.
@@ -191,32 +192,13 @@ debug: $(ESP_IMG)
 	  -serial file:$(SERIAL_LOG) -display none -no-reboot $(QEMU_NET) -s -S
 
 test: $(ESP_IMG)
-	@cp -f $(OVMF_VARS) $(BUILD)/OVMF_VARS.fd
-	@rm -f $(SERIAL_LOG)
-	@timeout $(RUN_TIMEOUT) $(QEMU) -machine $(QEMU_MACHINE),accel=$(QEMU_ACCEL) -cpu max -m $(QEMU_MEM) -smp $(QEMU_CPUS) \
-	  -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
-	  -drive if=pflash,format=raw,file=$(BUILD)/OVMF_VARS.fd \
-	  -drive file=$(ESP_IMG),format=raw,if=ide \
-	  -serial file:$(SERIAL_LOG) -display none -no-reboot $(QEMU_NET) || true
-	@echo "--- serial log ---"
-	@cat $(SERIAL_LOG)
-	@grep -q "MCUBE_BOOT_OK" $(SERIAL_LOG) && grep -q "SCHED_TEST_OK" $(SERIAL_LOG) \
-	  && grep -q "VFS_TEST_OK" $(SERIAL_LOG) \
-	  && grep -q "NET_PING_OK" $(SERIAL_LOG) \
-	  && grep -q "NET_DNS_OK" $(SERIAL_LOG) \
-	  && grep -q "NET_TEST_OK" $(SERIAL_LOG) \
-	  && grep -q "USER_INIT_OK" $(SERIAL_LOG) \
-	  && grep -q "USER_EFAULT_OK" $(SERIAL_LOG) \
-	  && grep -q "USER_EINVAL_OK" $(SERIAL_LOG) \
-	  && grep -q "USER_VFS_OK" $(SERIAL_LOG) \
-	  && grep -q "USER_DIR_OK" $(SERIAL_LOG) \
-	  && grep -q "USER_STAT_OK" $(SERIAL_LOG) \
-	  && grep -q "USER_TTY_OK" $(SERIAL_LOG) \
-	  && grep -q "USER_NET_OK" $(SERIAL_LOG) \
-	  && grep -q "USER_SHELL_OK" $(SERIAL_LOG) \
-	  && grep -q "USER_REDIR_OK" $(SERIAL_LOG) \
-	  && echo "TEST PASS: boot + scheduler + VFS + net + user/syscall markers found" \
-	  || (echo "TEST FAIL: boot/scheduler/VFS/net/user marker not found" && exit 1)
+	@bash tools/test.sh
+
+screenshot: $(ESP_IMG)
+	@bash tools/screenshot.sh
+
+gui-test: $(ESP_IMG)
+	@bash tools/gui-test.sh
 
 font:
 	python3 tools/gen_font.py

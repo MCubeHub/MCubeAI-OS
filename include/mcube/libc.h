@@ -53,6 +53,16 @@ int   execv(const char *path, char *const argv[]);
 int   execvp(const char *file, char *const argv[]);
 pid_t waitpid(pid_t pid, int *status, int options);
 void  sleep_ms(u64 ms);
+int   kill(pid_t pid, int sig);
+
+/* ---- graphics / desktop (M8) --------------------------------------- */
+int   fb_info(mcube_fb_info_t *info);
+void *fb_map(void);                 /* maps the GOP framebuffer, returns VA */
+int   input_poll(input_event_t *ev);/* 1 event, 0 empty, -1 error        */
+int   poll(mcube_pollfd_t *fds, int nfds, int timeout_ms);
+int   mc_time(mcube_time_t *ts);
+int   taskinfo(mcube_task_info_t *buf, int max);
+pid_t spawn(const char *path, char *const argv[], int cmd_fd, int evt_fd);
 
 void *brk(void *addr);
 void *sbrk(long delta);

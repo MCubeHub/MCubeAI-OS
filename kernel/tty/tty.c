@@ -79,30 +79,77 @@ static const char g_shiftmap[128] = {
 
 static int g_shift;
 static int g_caps;
+static int g_ext;
 
 static void kbd_irq(void *frame, void *ctx) {
     UNUSED(frame);
     UNUSED(ctx);
 
-    u8 sc = inb(KBD_DATA);
-    if (sc & 0x80) {
-        u8 code = (u8)(sc & 0x7F);
-        if (code == 0x2A || code == 0x36) g_shift = 0;
-        return;
-    }
-    if (sc == 0x2A || sc == 0x36) {
-        g_shift = 1;
-        return;
-    }
-    if (sc == 0x3A) {
-        g_caps = !g_caps;
+    u8 status = inb(0x64);
+    u8 sc = inb(0x60);
+
+    /* IRQ1 can carry auxiliary (mouse) bytes if the controller was left in a
+     * non-standard configuration. Feed them to the shared packet parser. */
+    if (status & 0x20) {
+        input_mouse_byte(sc);
         return;
     }
 
-    char c = g_shift ? g_shiftmap[sc] : g_keymap[sc];
-    if (!c) return;
-    if (g_caps && c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
-    tty_input(c);
+    if (sc == 0xE0) {          /* extended scancode prefix */
+        g_ext = 1;
+        return;
+    }
+    int ext = g_ext;
+    g_ext = 0;
+
+    if (sc & 0x80) {           /* key release */
+        u8 code = (u8)(sc & 0x7F);
+        if (!ext && (code == 0x2A || code == 0x36)) g_shift = 0;
+        return;
+    }
+    if (!ext && (sc == 0x2A || sc == 0x36)) {
+        g_shift = 1;
+        return;
+    }
+    if (!ext && sc == 0x3A) {
+        g_caps = !g_caps;
+        return;
+    }
+    if (!ext && (sc == 0x1D || sc == 0x38)) return; /* Ctrl / Alt press */
+
+    u32 code = 0;
+    if (ext) {
+        switch (sc) {
+        case 0x48: code = INPUT_KEY_UP; break;
+        case 0x50: code = INPUT_KEY_DOWN; break;
+        case 0x4B: code = INPUT_KEY_LEFT; break;
+        case 0x4D: code = INPUT_KEY_RIGHT; break;
+        case 0x53: code = INPUT_KEY_DELETE; break;
+        case 0x47: code = INPUT_KEY_HOME; break;
+        case 0x4F: code = INPUT_KEY_END; break;
+        case 0x49: code = INPUT_KEY_PGUP; break;
+        case 0x51: code = INPUT_KEY_PGDN; break;
+        case 0x1C: code = '\n'; break;      /* keypad Enter */
+        default: break;
+        }
+    } else if (sc >= 0x3B && sc <= 0x44) {
+        code = INPUT_KEY_F1 + (u32)(sc - 0x3B);
+    } else {
+        char c = g_shift ? g_shiftmap[sc] : g_keymap[sc];
+        if (g_caps && !g_shift && c >= 'a' && c <= 'z') {
+            c = (char)(c - 'a' + 'A');
+        }
+        if (c) code = (u8)c;
+    }
+    if (!code) return;
+
+    if (code < 0x100) {
+        char c = (char)code;
+        if (c == '\n' || c == '\b' || c == '\t' || c == 27 || c >= 32) {
+            tty_input(c);
+        }
+    }
+    input_push_key(code);
 }
 
 void keyboard_init(void) {

@@ -8,7 +8,7 @@
 
 #include <mcube/types.h>
 
-#define VFS_MAX_FDS   16
+#define VFS_MAX_FDS   32
 #define VFS_PATH_MAX  256
 #define VFS_NAME_MAX  64
 

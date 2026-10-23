@@ -404,6 +404,63 @@ int task_wait(u32 pid, int *status) {
     }
 }
 
+int task_kill(u32 pid, int status) {
+    u64 flags = irq_save();
+    if (!g_tasks) {
+        irq_restore(flags);
+        return -ESRCH;
+    }
+
+    task_t *t = g_tasks;
+    do {
+        if (t->pid == pid && t != g_idle) {
+            if (t == g_current) {
+                t->exit_status = (u32)status;
+                t->state = TASK_DEAD;
+                irq_restore(flags);
+                thread_exit();
+            }
+            t->exit_status = (u32)status;
+            t->state = TASK_DEAD;
+            t->wake_tick = 0;
+            g_need_resched = 1;
+            irq_restore(flags);
+            return 0;
+        }
+        t = t->next;
+    } while (t != g_tasks);
+
+    irq_restore(flags);
+    return -ESRCH;
+}
+
+u32 task_snapshot(mcube_task_info_t *out, u32 max) {
+    if (!out || max == 0) return 0;
+
+    /* Keep the list stable while copying: reap_dead() runs from schedule(). */
+    u64 flags = irq_save();
+    u32 n = 0;
+    if (g_tasks) {
+        task_t *t = g_tasks;
+        do {
+            if (n >= max) break;
+            out[n].pid = t->pid;
+            out[n].ppid = t->ppid;
+            out[n].state = t->state;
+            out[n].flags = t->flags;
+            out[n].ticks = t->total_ticks;
+            out[n].switches = t->switches;
+            out[n].syscalls = t->syscalls;
+            strncpy(out[n].name, t->name, sizeof(out[n].name) - 1);
+            out[n].name[sizeof(out[n].name) - 1] = 0;
+            n++;
+            t = t->next;
+        } while (t != g_tasks);
+    }
+    irq_restore(flags);
+    return n;
+}
+
 void sched_start(void) {
     static u64 boot_rsp;
     g_active = 1;

@@ -18,4 +18,5 @@ void pipe_end_ref(struct pipe_end *e);
 void pipe_end_close(struct pipe_end *e);
 long pipe_read(struct pipe_end *e, void *buf, u64 len);
 long pipe_write(struct pipe_end *e, const void *buf, u64 len);
+int  pipe_readable(struct pipe_end *e);
 void pipe_task_cleanup(struct task *t);
