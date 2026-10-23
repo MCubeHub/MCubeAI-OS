@@ -10,6 +10,8 @@
 #include <mcube/kernel.h>
 #include <mcube/io.h>
 #include <mcube/mm.h>
+#include <mcube/timer.h>
+#include <mcube/sched.h>
 
 #define MCUBE_VERSION "0.1.0"
 #define MCUBE_CODENAME "Genesis"
@@ -98,6 +100,29 @@ static u64 usable_bytes(const boot_info_t *bi) {
     return usable;
 }
 
+static volatile int g_soft_timer_fired;
+static void soft_timer_cb(void *arg) {
+    *(volatile int *)arg = 1;
+}
+
+static void sched_demo(void *arg) {
+    const char *name = (const char *)arg;
+    for (u32 i = 0; i < 4; i++) {
+        kprintf("[sched] %s: iteration %u\n", name, i);
+        task_sleep_ms(8);
+    }
+    kprintf("[sched] %s: exiting\n", name);
+}
+
+static void sched_monitor(void *arg) {
+    UNUSED(arg);
+    task_sleep_ms(180);
+    kprintf("[sched] demo threads finished, task count %u\n", task_count());
+    sched_dump();
+    kprintf("SCHED_TEST_OK\n");
+    for (;;) task_sleep_ms(1000);
+}
+
 void kernel_main(boot_info_t *bi) {
     serial_init();
     console_init(bi);
@@ -114,6 +139,7 @@ void kernel_main(boot_info_t *bi) {
     gdt_init();
     kprintf("[cpu] loading IDT (256 vectors) and remapping PIC...\n");
     idt_init();
+    timer_init();
 
     kprintf("[mm] initialising physical allocator...\n");
     pmm_init(bi);
@@ -125,14 +151,37 @@ void kernel_main(boot_info_t *bi) {
     }
     kmalloc_dump_stats();
 
+    /* Timer acceptance: ticks must advance and a soft timer must fire. */
+    g_soft_timer_fired = 0;
+    timer_add(20, 0, soft_timer_cb, (void *)&g_soft_timer_fired);
+    cpu_sti();
+    u64 t0 = timer_uptime_ms();
+    timer_sleep_ms(50);
+    u64 elapsed = timer_uptime_ms() - t0;
+    kprintf("[time] uptime %u ms after sleeping 50 ms, wall clock epoch %u\n",
+            (u32)elapsed, (u32)timer_boot_time_unix());
+    if (elapsed < 40 || elapsed > 500) {
+        panic("PIT timer is not ticking correctly (elapsed=%u)", (u32)elapsed);
+    }
+    if (!g_soft_timer_fired) {
+        panic("soft timer did not fire");
+    }
+    kprintf("[time] soft timer fired, tick source OK\n");
+
     ai_subsys_init();
 
     kprintf("[init] kernel %s (%s) boot complete, %u MiB usable\n",
             MCUBE_VERSION, MCUBE_CODENAME, (u32)(usable_bytes(bi) / MiB));
-    kprintf("[init] halting: milestone M2 (virtual memory + scheduler) is next\n");
     kprintf("\nMCUBE_BOOT_OK\n");
 
-    for (;;) {
-        cpu_hlt();
-    }
+    /* Hand the CPU to the round-robin scheduler. kernel_main's stack becomes
+     * the abandoned boot context; all further work runs in kernel threads. */
+    sched_init();
+    task_create("alpha", sched_demo, (void *)"alpha");
+    task_create("beta", sched_demo, (void *)"beta");
+    task_create("gamma", sched_demo, (void *)"gamma");
+    task_create("monitor", sched_monitor, NULL);
+    kprintf("[sched] starting kernel threads (RR, %u ms quantum)\n",
+            SCHED_QUANTUM_TICKS);
+    sched_start();
 }

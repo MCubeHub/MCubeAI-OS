@@ -1,0 +1,270 @@
+/* Round-robin kernel thread scheduler.
+ *
+ * Interrupt-driven preemption happens from the PIT IRQ: sched_tick() decides
+ * whether the quantum expired, and the IRQ epilogue calls schedule(). The
+ * interrupt itself is EOI'd before the handler runs, so switching away from an
+ * IRQ handler cannot block the PIC.
+ */
+
+#include <mcube/sched.h>
+#include <mcube/kernel.h>
+#include <mcube/mm.h>
+#include <mcube/io.h>
+#include <mcube/atomic.h>
+
+#define KERNEL_STACK_SIZE (16 * 1024)
+#define IDLE_PID 0
+
+extern void context_switch(u64 *old_rsp, u64 new_rsp);
+extern void thread_entry_trampoline(void);
+
+static task_t *g_current;
+static task_t *g_idle;
+static task_t *g_tasks;
+static volatile int g_active;
+static volatile int g_need_resched;
+static u32 g_next_pid = 1;
+static u32 g_task_count;
+
+static void idle_main(void *arg) {
+    UNUSED(arg);
+    for (;;) {
+        cpu_hlt();
+    }
+}
+
+static void task_list_add(task_t *t) {
+    if (!g_tasks) {
+        g_tasks = t;
+        t->next = t;
+        return;
+    }
+    task_t *tail = g_tasks;
+    while (tail->next != g_tasks) tail = tail->next;
+    tail->next = t;
+    t->next = g_tasks;
+}
+
+static void task_list_remove(task_t *t) {
+    if (!g_tasks) return;
+    if (g_tasks == t) {
+        if (t->next == t) {
+            g_tasks = NULL;
+            return;
+        }
+        task_t *tail = g_tasks;
+        while (tail->next != g_tasks) tail = tail->next;
+        g_tasks = t->next;
+        tail->next = g_tasks;
+        return;
+    }
+    task_t *prev = g_tasks;
+    while (prev->next != g_tasks && prev->next != t) prev = prev->next;
+    if (prev->next == t) prev->next = t->next;
+}
+
+task_t *task_create(const char *name, void (*entry)(void *), void *arg) {
+    task_t *t = kzalloc(sizeof(task_t));
+    if (!t) return NULL;
+
+    void *stack = kmalloc(KERNEL_STACK_SIZE);
+    if (!stack) {
+        kfree(t);
+        return NULL;
+    }
+
+    t->kstack_base = (u64)(uptr)stack;
+    t->kstack_size = KERNEL_STACK_SIZE;
+    t->pid = g_next_pid++;
+    t->state = TASK_READY;
+    t->prio = 1;
+    t->ticks_left = SCHED_QUANTUM_TICKS;
+    t->wake_tick = 0;
+    t->total_ticks = 0;
+    t->switches = 0;
+    strncpy(t->name, name ? name : "task", sizeof(t->name) - 1);
+
+    u64 top = ALIGN_DOWN((u64)(uptr)stack + KERNEL_STACK_SIZE, 16);
+    u64 *sp = (u64 *)top;
+    *--sp = (u64)(uptr)thread_entry_trampoline; /* ret target                  */
+    *--sp = 0;                                  /* rbp                         */
+    *--sp = 0;                                  /* rbx                         */
+    *--sp = (u64)(uptr)arg;                     /* r12 -> first argument       */
+    *--sp = (u64)(uptr)entry;                   /* r13 -> thread entry         */
+    *--sp = 0;                                  /* r14                         */
+    *--sp = 0;                                  /* r15                         */
+    t->rsp = (u64)(uptr)sp;
+
+    task_list_add(t);
+    g_task_count++;
+    return t;
+}
+
+void sched_init(void) {
+    g_tasks = NULL;
+    g_current = NULL;
+    g_active = 0;
+    g_need_resched = 0;
+    g_task_count = 0;
+
+    g_idle = task_create("idle", idle_main, NULL);
+    if (!g_idle) panic("sched: cannot create idle task");
+    g_idle->pid = IDLE_PID;
+    g_idle->prio = 0;
+
+    g_current = g_idle;
+    g_idle->state = TASK_RUNNING;
+    kprintf("[sched] round-robin scheduler ready, quantum %u ms, idle pid 0\n",
+            SCHED_QUANTUM_TICKS);
+}
+
+static task_t *pick_next(void) {
+    task_t *start = g_current ? g_current->next : g_tasks;
+    task_t *t = start;
+    do {
+        if (t->state == TASK_READY) return t;
+        t = t->next;
+    } while (t != start);
+
+    if (g_idle && g_idle->state != TASK_RUNNING) return g_idle;
+    return g_idle;
+}
+
+static void reap_dead(void) {
+    if (!g_tasks) return;
+    task_t *t = g_tasks;
+    task_t *start = t;
+    do {
+        task_t *next = t->next;
+        if (t->state == TASK_DEAD && t != g_current && t != g_idle) {
+            task_list_remove(t);
+            if (g_task_count) g_task_count--;
+            u64 stack = t->kstack_base;
+            kfree(t);
+            kfree((void *)(uptr)stack);
+        }
+        t = next;
+    } while (g_tasks && t != start);
+}
+
+void schedule(void) {
+    if (!g_active) return;
+
+    u64 flags = irq_save();
+    reap_dead();
+    task_t *prev = g_current;
+    task_t *next = pick_next();
+    if (!next) next = g_idle;
+    if (next == prev) {
+        g_need_resched = 0;
+        irq_restore(flags);
+        return;
+    }
+
+    if (prev->state == TASK_RUNNING) prev->state = TASK_READY;
+    next->state = TASK_RUNNING;
+    next->switches++;
+    g_current = next;
+    g_need_resched = 0;
+
+    context_switch(&prev->rsp, next->rsp);
+    irq_restore(flags);
+}
+
+void sched_tick(void) {
+    if (!g_active) return;
+    task_t *cur = g_current;
+    if (!cur) return;
+
+    cur->total_ticks++;
+
+    /* Wake sleeping tasks. */
+    u64 now = timer_ticks();
+    task_t *t = g_tasks;
+    if (t) {
+        do {
+            if (t->state == TASK_BLOCKED && t->wake_tick && t->wake_tick <= now) {
+                t->wake_tick = 0;
+                t->state = TASK_READY;
+            }
+            t = t->next;
+        } while (t != g_tasks);
+    }
+
+    if (cur->prio == 0) {
+        /* Idle must hand the CPU to any runnable task. */
+        task_t *t = g_tasks;
+        if (t) {
+            do {
+                if (t->state == TASK_READY) {
+                    g_need_resched = 1;
+                    break;
+                }
+                t = t->next;
+            } while (t != g_tasks);
+        }
+        return;
+    }
+    if (cur->ticks_left > 0) cur->ticks_left--;
+    if (cur->ticks_left == 0) {
+        cur->ticks_left = SCHED_QUANTUM_TICKS;
+        g_need_resched = 1;
+    }
+}
+
+int sched_need_resched(void) { return g_need_resched; }
+
+void task_sleep_ms(u64 ms) {
+    if (!g_active) {
+        timer_sleep_ms(ms);
+        return;
+    }
+    u64 flags = irq_save();
+    g_current->wake_tick = timer_ticks() + ms;
+    g_current->state = TASK_BLOCKED;
+    g_need_resched = 1;
+    irq_restore(flags);
+    schedule();
+}
+
+void task_yield(void) {
+    if (!g_active) return;
+    g_need_resched = 1;
+    schedule();
+}
+
+NORETURN void thread_exit(void) {
+    u64 flags = irq_save();
+    task_t *t = g_current;
+    t->state = TASK_DEAD;
+    g_need_resched = 1;
+    (void)flags;
+    schedule();
+    /* A dead task must never be picked again. */
+    for (;;) cpu_hlt();
+}
+
+task_t *current_task(void) { return g_current; }
+u32 task_count(void) { return g_task_count; }
+
+void sched_start(void) {
+    static u64 boot_rsp;
+    g_active = 1;
+    g_current = g_idle;
+    g_idle->state = TASK_RUNNING;
+    g_idle->switches++;
+    context_switch(&boot_rsp, g_idle->rsp);
+    panic("scheduler returned to boot context");
+}
+
+void sched_dump(void) {
+    task_t *t = g_tasks;
+    if (!t) return;
+    kprintf("[sched] tasks:\n");
+    do {
+        kprintf("  pid %-3u %-12s state %u prio %u ticks %u switches %u\n",
+                t->pid, t->name, t->state, t->prio,
+                (u32)t->total_ticks, (u32)t->switches);
+        t = t->next;
+    } while (t != g_tasks);
+}

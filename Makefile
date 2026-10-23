@@ -127,8 +127,9 @@ test: $(ESP_IMG)
 	  -serial file:$(SERIAL_LOG) -display none -no-reboot -net none || true
 	@echo "--- serial log ---"
 	@cat $(SERIAL_LOG)
-	@grep -q "MCUBE_BOOT_OK" $(SERIAL_LOG) && echo "TEST PASS: kernel reached MCUBE_BOOT_OK" \
-	  || (echo "TEST FAIL: marker not found" && exit 1)
+	@grep -q "MCUBE_BOOT_OK" $(SERIAL_LOG) && grep -q "SCHED_TEST_OK" $(SERIAL_LOG) \
+	  && echo "TEST PASS: boot + scheduler markers found" \
+	  || (echo "TEST FAIL: boot/scheduler marker not found" && exit 1)
 
 font:
 	python3 tools/gen_font.py
