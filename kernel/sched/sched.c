@@ -182,6 +182,7 @@ static void reap_dead(void) {
         if (t->state == TASK_DEAD && t != g_current && t != g_idle) {
             task_list_remove(t);
             if (g_task_count) g_task_count--;
+            vfs_task_cleanup(t);
             u64 stack = t->kstack_base;
             u64 pml4 = t->pml4_phys;
             kfree(t);

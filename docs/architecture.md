@@ -70,8 +70,8 @@
 | 虚拟内存 | `mm_struct { pml4, vma_list, brk, stack_top }`、`vm_area` | 每进程地址空间 |
 | 调度 | `task_struct { pid, state, prio, vruntime, ctx, mm, files, cred }` | RR + MLFQ 接口 |
 | 同步 | `spinlock_t`、`mutex_t`、`wait_queue_head_t` | 中断安全自旋锁 |
-| VFS | `super_block`、`inode`、`dentry`、`file` | page cache 挂在 inode |
-| 块层 | `bio`、`request_queue`、`block_device` | AHCI/NVMe 共用 |
+| VFS | `vfs_mount`、`vfs_inode`、`vfs_file`、`fat32_fs`/`fat32_node` | 最长前缀挂载，fd 表在 `task_t` |
+| 块层 | `block_device`、`fat32_fs` | ATA PIO 已接入，AHCI/NVMe 预留 |
 | 设备 | `device`、`driver`、`bus_type` | PCI/USB 匹配与电源状态 |
 | 网络 | `socket`、`sk_buff`、`net_device` | e1000 + IPv4 栈 |
 | AI 内核侧 | `ai_channel`、`ai_audit_event` | 共享内存环 + 审计队列 |
@@ -89,15 +89,23 @@
 - `ai_*` 号段（`0x400` 起）：
   `ai_session_create/send/stream_read/cancel/tool_register/status/memory_*`。
 - 兼容层：AArch64 使用 `svc #0`，系统调用号表保持一致。
+- M5 已落地：`read/write/open/close/stat/fstat/getdents64/mkdir/unlink`
+  （号段与 Linux x86_64 对齐）。`mcube_stat_t` 与 `mcube_dirent_t`
+  是固定大小的共享 ABI 结构，内核侧对应 `vfs_stat_t`/`vfs_dirent_t`。
+- 文件描述符 0/1/2 保留给控制台；3..15 由每任务 fd 表分配。
+  `read(0)` 从 TTY 环形队列取数据，空队列返回 `-EAGAIN`。
 
 ## 6. 文件系统与设备模型
 
-- VFS 统一 `open/read/write/ioctl/mmap`；dentry/inode 缓存带 LRU。
-- 首版实际文件系统选择 FAT32（UEFI 可直接挂载，便于自举），
-  tmpfs 承载 `/tmp`、`/dev/shm`；ext2 作为第二实现验证 VFS 抽象。
-- 块层提供分区扫描（MBR，GPT 预留）、请求合并、超时重试与统计。
-- `/dev` 由 devtmpfs 风格的内核自动创建，主/次设备号 + 权限位。
-- TTY 行规程独立成 `tty_ldisc`，PTY 用于终端模拟器。
+- VFS 统一 `open/read/write/stat/getdents64`；当前按打开实例分配 inode，
+  dentry/page cache 与 LRU 留待后续。
+- 首版实际文件系统选择 FAT32（UEFI 可直接挂载，便于自举）：
+  superfloppy 或 MBR 首分区、512 字节扇区、8.3 目录项、双 FAT 同步。
+  tmpfs 承载 `/tmp`，devfs 提供 `/dev/{console,tty0,ttyS0,null,zero}`。
+- 块层当前为同步 ATA PIO（主通道 LBA28）；分区扫描（MBR，GPT 预留）、
+  请求合并、超时重试与统计随 AHCI/NVMe 一起补齐。
+- `/dev` 由 devfs 在挂载时提供固定设备节点；主/次设备号与权限位待扩展。
+- TTY 输入来自 PS/2 IRQ1 与 COM1 IRQ4；行规程、PTY 与控制台切换待实现。
 
 ## 7. AI 原生层接口
 

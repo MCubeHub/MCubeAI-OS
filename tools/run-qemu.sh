@@ -26,7 +26,7 @@ if [[ -n "${SHOT}" ]]; then
 fi
 
 qemu-system-x86_64 \
-  -machine q35,accel="${QEMU_ACCEL:-tcg}" -cpu max -m 512M -smp 1 \
+  -machine "${QEMU_MACHINE:-pc}",accel="${QEMU_ACCEL:-tcg}" -cpu max -m 512M -smp 1 \
   -drive if=pflash,format=raw,readonly=on,file="${OVMF_CODE}" \
   -drive if=pflash,format=raw,file="${BUILD}/OVMF_VARS.fd" \
   -drive file="${BUILD}/esp.img",format=raw,if=ide \

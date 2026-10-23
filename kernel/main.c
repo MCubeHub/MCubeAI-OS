@@ -19,6 +19,9 @@
 #include <mcube/percpu.h>
 #include <mcube/syscall.h>
 #include <mcube/user.h>
+#include <mcube/block.h>
+#include <mcube/vfs.h>
+#include <mcube/tty.h>
 
 #define MCUBE_VERSION "0.1.0"
 #define MCUBE_CODENAME "Genesis"
@@ -168,6 +171,14 @@ void kernel_main(boot_info_t *bi) {
     kmalloc_dump_stats();
 
     syscall_init();
+    block_init();
+    block_dump();
+    tty_init();
+    if (vfs_init() == 0) {
+        vfs_selftest();
+    } else {
+        kprintf("[vfs] filesystem self test skipped (root not mounted)\n");
+    }
 
     /* Timer acceptance: ticks must advance and a soft timer must fire. */
     g_soft_timer_fired = 0;

@@ -54,17 +54,25 @@
 - 验收：init 在用户态打印并退出；非法指针返回 `-EFAULT`、超大长度
   返回 `-EINVAL`，内核不 panic。
 
-## M5 — 文件系统、块设备、TTY
+## M5 — 文件系统、块设备、TTY（核心完成）
 
-对应清单：三.1–三.5。
+对应清单：三.1–三.3、三.5 的一部分。
 
-- VFS：inode/dentry/file/superblock、page cache、路径解析。
-- tmpfs（initrd）与 FAT32 读写；MBR 分区表；日志文件系统预留。
-- AHCI（DMA）与 NVMe 基础读写、块层请求队列与错误重试。
-- TTY/PTY：行规程、Ctrl+C/Z/D、前后台进程组、多控制台。
-- PS/2 键盘鼠标、`/dev/input/*`、`/dev` 设备节点与权限。
-- 验收：`mount`、`ls/cat/cp` 在 FAT32 镜像上成功；断电模拟后 FAT 不损坏；
-  Ctrl+C 能终止前台进程；`/dev/ttyS0` 可读写。
+- 已实现：
+  - 块设备注册层 + ATA PIO 驱动（主通道，LBA28 读写/IDENTIFY）。
+  - FAT32 读写：superfloppy 与 MBR 首分区、8.3 目录项、簇链分配/释放、
+    创建/删除/截断、目录扩展、双 FAT 同步与扇区缓存。
+  - VFS：最长前缀挂载、`vfs_inode`/`vfs_file` 抽象、每任务 16 项 fd 表。
+  - 挂载：FAT32 `/`、tmpfs `/tmp`、devfs `/dev`
+    （`console`、`tty0`、`ttyS0`、`null`、`zero`）。
+  - 系统调用：`open/read/write/close/stat/fstat/getdents64/mkdir/unlink`。
+  - TTY 输入：PS/2 键盘 IRQ1 + COM1 RX IRQ4 汇入环形队列；
+    非阻塞读取（空队列返回 `-EAGAIN`）。
+- 待实现：AHCI/NVMe、块层请求队列与错误重试、页缓存、LFN 长文件名、
+  PTY/行规程/前后台进程组、鼠标与 `/dev/input/*`。
+- 验收：内核自检列根目录、读 `/kernel.elf` 的 ELF magic、FAT32 与 tmpfs
+  写入回读、`/dev/zero`；init 读取 `/TEST.TXT`、枚举 `/`、`stat`
+  内核 ELF，并经 `/dev/ttyS0` 输出。`make test` 断言全部通过。
 
 ## M6 — 网络
 

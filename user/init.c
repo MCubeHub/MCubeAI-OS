@@ -2,10 +2,12 @@
  *
  * Freestanding, statically linked at USER_BASE. It exercises the syscall ABI:
  * console write, getpid, invalid-pointer and oversized-length rejection,
- * nanosleep and exit. Real init/exec arrives with the VFS in M5.
+ * nanosleep, FAT32 read, directory listing, stat, and writes through the
+ * /dev/ttyS0 device node. Real init/exec arrives with the POSIX libc in M7.
  */
 
 #include <mcube/syscall.h>
+#include <mcube/vfs.h>
 
 static long sys3(long n, long a, long b, long c) {
     long r;
@@ -67,6 +69,49 @@ void _start(void) {
 
     long huge = sys3(SYS_WRITE, 1, (long)"x", 1L << 21);
     if (huge == -EINVAL) swrite("USER_EINVAL_OK\n");
+
+    /* Read the file the kernel wrote during its VFS self test. */
+    long fd = sys3(SYS_OPEN, (long)"/TEST.TXT", VFS_O_RDONLY, 0);
+    if (fd >= 3) {
+        char buf[64];
+        long n = sys3(SYS_READ, fd, (long)buf, (long)sizeof(buf));
+        sys3(SYS_CLOSE, fd, 0, 0);
+        if (n > 0) {
+            swrite("USER_VFS_OK: ");
+            swrite_n(buf, (u64)n);
+        }
+    } else {
+        swrite("USER_VFS_FAIL\n");
+    }
+
+    /* Enumerate the FAT32 root through getdents64. */
+    long dfd = sys3(SYS_OPEN, (long)"/", VFS_O_RDONLY, 0);
+    if (dfd >= 3) {
+        mcube_dirent_t ent;
+        long n;
+        int count = 0;
+        while ((n = sys3(SYS_GETDENTS64, dfd, (long)&ent, (long)sizeof(ent))) > 0) {
+            swrite("  /");
+            swrite_n(ent.name, ent.namelen);
+            swrite("\n");
+            if (++count > 32) break;
+        }
+        sys3(SYS_CLOSE, dfd, 0, 0);
+        if (count >= 2) swrite("USER_DIR_OK\n");
+    }
+
+    mcube_stat_t st;
+    if (sys3(SYS_STAT, (long)"/kernel.elf", (long)&st, 0) == 0 && st.size > 0) {
+        swrite("USER_STAT_OK\n");
+    }
+
+    /* Character device write path. */
+    long tfd = sys3(SYS_OPEN, (long)"/dev/ttyS0", VFS_O_WRONLY, 0);
+    if (tfd >= 3) {
+        const char *msg = "USER_TTY_OK\n";
+        sys3(SYS_WRITE, tfd, (long)msg, (long)slen(msg));
+        sys3(SYS_CLOSE, tfd, 0, 0);
+    }
 
     sys1(SYS_NANOSLEEP, 40);
     swrite("USER_INIT_OK\n");

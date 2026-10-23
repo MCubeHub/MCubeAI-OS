@@ -3,6 +3,7 @@
 
 #include <mcube/types.h>
 #include <mcube/timer.h>
+#include <mcube/vfs.h>
 
 enum task_state {
     TASK_READY = 0,
@@ -30,6 +31,7 @@ typedef struct task {
     u64 pml4_phys;           /* 0 = kernel address space */
     u64 user_entry;
     u64 user_stack_top;
+    struct vfs_file *files[VFS_MAX_FDS];
     char name[24];
     struct task *next;
 } task_t;

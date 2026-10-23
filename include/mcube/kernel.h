@@ -38,6 +38,9 @@ void fb_write(const char *s);
 void console_init(const boot_info_t *bi);
 void console_clear(void);
 
+/* drivers/keyboard.c (implemented in kernel/tty/tty.c) */
+void keyboard_init(void);
+
 /* panic.c */
 NORETURN void panic(const char *fmt, ...);
 NORETURN void panic_at(const char *file, int line, const char *fmt, ...);
