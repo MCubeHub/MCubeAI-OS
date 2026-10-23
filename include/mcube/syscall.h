@@ -24,7 +24,10 @@
 #define SYS_MUNMAP    11
 #define SYS_BRK       12
 #define SYS_IOCTL     16
+#define SYS_PIPE      22
 #define SYS_YIELD     24
+#define SYS_DUP       32
+#define SYS_DUP2      33
 #define SYS_NANOSLEEP 35
 #define SYS_GETPID    39
 #define SYS_SOCKET    41
@@ -32,13 +35,22 @@
 #define SYS_SENDTO    44
 #define SYS_RECVFROM  45
 #define SYS_BIND      49
-#define SYS_EXIT      60
-#define SYS_MKDIR     83
-#define SYS_UNLINK    87
-#define SYS_GETTID    186
-#define SYS_GETDENTS64 217
 #define SYS_SETSOCKOPT 54
 #define SYS_GETSOCKOPT 55
+#define SYS_FORK      57
+#define SYS_VFORK     58
+#define SYS_EXECVE    59
+#define SYS_EXIT      60
+#define SYS_WAIT4     61
+#define SYS_KILL      62
+#define SYS_GETCWD    79
+#define SYS_CHDIR     80
+#define SYS_MKDIR     83
+#define SYS_RMDIR     84
+#define SYS_UNLINK    87
+#define SYS_GETPPID   110
+#define SYS_GETTID    186
+#define SYS_GETDENTS64 217
 
 /* Socket constants mirrored from <mcube/net.h> so user programs only need
  * this header. Identical values make the duplicate definitions harmless. */
@@ -82,6 +94,7 @@ typedef struct PACKED mcube_dirent {
 #define EINTR    4
 #define EIO      5
 #define EBADF    9
+#define ECHILD   10
 #define EAGAIN   11
 #define ENOMEM   12
 #define EFAULT   14
@@ -94,6 +107,8 @@ typedef struct PACKED mcube_dirent {
 #define ENOTTY   25
 #define ENOSPC   28
 #define ESPIPE   29
+#define EPIPE    32
+#define ERANGE   34
 #define ENAMETOOLONG 36
 #define ENOSYS   38
 #define ENOTEMPTY 39

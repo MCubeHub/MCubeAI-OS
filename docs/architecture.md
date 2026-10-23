@@ -92,13 +92,29 @@
 - M5 已落地：`read/write/open/close/stat/fstat/getdents64/mkdir/unlink`
   （号段与 Linux x86_64 对齐）。`mcube_stat_t` 与 `mcube_dirent_t`
   是固定大小的共享 ABI 结构，内核侧对应 `vfs_stat_t`/`vfs_dirent_t`。
-- 文件描述符 0/1/2 保留给控制台；3..15 由每任务 fd 表分配。
+- 文件描述符 0/1/2 默认连接到控制台；3..15 由每任务 fd 表分配。
   `read(0)` 从 TTY 环形队列取数据，空队列返回 `-EAGAIN`。
 - M6 已落地：`socket(41)/connect(42)/sendto(44)/recvfrom(45)/bind(49)`。
   socket 与文件共用 fd 空间：`task_t->files[]` 存 VFS 句柄，
   `task_t->socks[]` 存 socket 对象，分配时两者都为空才算空闲；
   任务退出时 `net_task_cleanup()` 回收。地址结构 `mcube_sockaddr_in_t`
   与 Linux `sockaddr_in` 线格式一致（网络字节序）。
+- M7 已落地：`fork(57)/execve(59)/wait4(61)/pipe(22)/dup(32)/dup2(33)/
+  chdir(80)/getcwd(79)/brk(12)/getppid(110)/rmdir(84)`。
+  - `fork` 克隆整个用户地址空间（逐级复制页表与页帧），并按引用计数
+    继承 `files[]/socks[]/pipes[]`；子进程通过 `task_create_user_fork()`
+    构造的内核栈回到 `syscall_return_tail`，恢复**全部**用户寄存器后
+    `sysretq`，因此 `rbx/r12-r15` 等被调用者保存寄存器与父进程一致。
+  - `execve` 新建地址空间、在用户栈顶构造 argc/argv/envp，替换 CR3，
+    但保留 fd 表（供 shell 在 fork 后 `dup2` 重定向）。
+  - `dup2` 对 VFS 文件、socket、管道统一做引用计数复制；0/1/2 也可以
+    作为 `dup2` 的目标，`sys_read/sys_write` 在查控制台回退之前先检查
+    `pipes[fd]` 与 `files[fd]`，因此 `cmd | cmd`、`cmd > file`、
+    `2>&1` 均可用。
+  - 管道为 4 KiB 环形缓冲；读空/写满时任务睡眠，写端全部关闭后读端
+    返回 0，读端全部关闭后写端返回 `-EPIPE`。
+  - `brk` 在 `0x0100_0000`–`0x0200_0000` 之间按页映射堆；用户态
+    `malloc` 是建立在 `brk` 上的 bump 分配器（`free` 暂为空操作）。
 
 ## 6. 文件系统与设备模型
 
@@ -115,6 +131,13 @@
   （32 项 RX/TX 环、IMS=0 纯轮询）→ `net_receive()` 分发 ARP/IPv4 →
   ICMP/UDP/DNS。ARP 表 16 项，发送路径按掩码选择直连或网关。
   TCP 在 M6.1 接入，DHCP/IPv6 随后。
+- 用户程序统一链接在 `0x40_0000`，入口 `_start`（`user/lib/crt0.asm`）
+  从内核构造的栈读取 argc/argv/envp 后调用 `main`。PID 1 的 ELF 内嵌在
+  内核镜像中（`tools/gen_blob.py`），其余程序从 ESP 的 `/BIN` 读取；
+  文件名采用 8.3 大写形式（`SH.ELF`、`LS.ELF`），VFS 查找大小写不敏感。
+- Shell 是普通用户进程：`fork` 每个管道阶段，用 `dup2` 接好管道/文件后
+  `execve`；内建命令在 shell 进程内执行，重定向通过临时 `dup2` 到
+  0/1 并在结束后恢复 `/dev/console`。
 
 ## 7. AI 原生层接口
 

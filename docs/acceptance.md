@@ -53,15 +53,15 @@
 
 ## 四、用户空间层（M7–M8）
 
-| ID | 项目 | 验证方式 | 通过条件 |
-| --- | --- | --- | --- |
-| U-01 | libc 内存/字符串 | `make libc-test` | 单元测试全绿，malloc/free 无泄漏 |
-| U-02 | printf | `libc-test` | 格式化输出与 glibc 对比一致（覆盖宽度/精度） |
-| U-03 | Shell 解析 | `sh-test` | 引号、转义、变量、PATH 查找正确 |
-| U-04 | 管道/重定向 | `manual` | `ls / | grep bin | wc -l` 输出正确 |
-| U-05 | 作业控制 | `manual` | Ctrl+Z/bg/fg/jobs 行为正确 |
-| U-06 | 历史/补全 | `manual` | 上下键浏览，Tab 文件名补全 |
-| U-07 | coreutils | `coreutils-test` | 文件/文本/系统工具基准用例通过 |
+| ID | 项目 | 验证方式 | 通过条件 | 状态 |
+| --- | --- | --- | --- | --- |
+| U-01 | libc 内存/字符串 | `make libc-test` | 单元测试全绿，malloc/free 无泄漏 | 部分：string/stdio/stdlib 已随 coreutils 运行，host 单测待补 |
+| U-02 | printf | `libc-test` | 格式化输出与 glibc 对比一致（覆盖宽度/精度） | 部分：`%d/%u/%x/%p/%s/%c` 与宽度/补零已用 |
+| U-03 | Shell 解析 | `sh-test` | 引号、转义、变量、PATH 查找正确 | 通过：`sh -c` 与交互式实测 |
+| U-04 | 管道/重定向 | `manual` | `ls / | grep bin | wc -l` 输出正确 | 通过：`ls /bin | wc -l`、`echo x > /tmp/f` 回读 |
+| U-05 | 作业控制 | `manual` | Ctrl+Z/bg/fg/jobs 行为正确 | 部分：`&` 后台与 `jobs` 已实现，Ctrl+Z/bg/fg 待补 |
+| U-06 | 历史/补全 | `manual` | 上下键浏览，Tab 文件名补全 | 待实现 |
+| U-07 | coreutils | `coreutils-test` | 文件/文本/系统工具基准用例通过 | 部分：20 个工具可用，基准脚本待补 |
 | U-08 | 行编辑器 | `manual` | 打开、编辑、保存、退出，非法输入不崩溃 |
 | U-09 | 帧缓冲双缓冲 | 截图 | 无撕裂，窗口拖动无残影 |
 | U-10 | 字体 | 截图 | 英文清晰，内置常用汉字可显示 |

@@ -15,6 +15,8 @@
 #include <mcube/vfs.h>
 #include <mcube/tty.h>
 #include <mcube/net.h>
+#include <mcube/pipe.h>
+#include <mcube/mm.h>
 
 /* Selectors: kernel code 0x08, kernel data 0x10, user data 0x18, user code
  * 0x20. STAR encodes both the syscall and sysret pairs. */
@@ -22,6 +24,7 @@
 #define KERNEL_DS 0x10
 
 #define USER_IO_MAX (1ULL << 20)
+#define EXEC_MAX_VEC 32
 
 extern void syscall_entry(void);
 
@@ -56,11 +59,34 @@ static vfs_file_t **current_files(void) {
     return t ? t->files : NULL;
 }
 
+/* Resolve a user path against the task's working directory. */
+static int make_path(char *dst, u64 upath) {
+    char raw[VFS_PATH_MAX];
+    int rc = copy_path_from_user(raw, upath, sizeof(raw));
+    if (rc != 0) return rc;
+
+    task_t *t = current_task();
+    if (raw[0] == '/' || !t || t->cwd[0] != '/') {
+        usize n = strlen(raw);
+        if (n >= VFS_PATH_MAX) return -ENAMETOOLONG;
+        memcpy(dst, raw, n + 1);
+        return 0;
+    }
+
+    usize clen = strlen(t->cwd);
+    usize rlen = strlen(raw);
+    if (clen + 1 + rlen >= VFS_PATH_MAX) return -ENAMETOOLONG;
+    memcpy(dst, t->cwd, clen);
+    dst[clen] = '/';
+    memcpy(dst + clen + 1, raw, rlen + 1);
+    return 0;
+}
+
 static int fd_alloc(vfs_file_t **files, vfs_file_t *f) {
     if (!files) return -ESRCH;
     task_t *t = current_task();
     for (int i = 3; i < VFS_MAX_FDS; i++) {
-        if (!files[i] && !(t && t->socks[i])) {
+        if (!files[i] && !(t && t->socks[i]) && !(t && t->pipes[i])) {
             files[i] = f;
             return i;
         }
@@ -69,7 +95,7 @@ static int fd_alloc(vfs_file_t **files, vfs_file_t *f) {
 }
 
 static vfs_file_t *fd_get(vfs_file_t **files, int fd) {
-    if (!files || fd < 3 || fd >= VFS_MAX_FDS) return NULL;
+    if (!files || fd < 0 || fd >= VFS_MAX_FDS) return NULL;
     return files[fd];
 }
 
@@ -238,7 +264,7 @@ static long console_write(u64 ubuf, u64 len) {
 
 static long sys_open(u64 upath, int flags) {
     char path[VFS_PATH_MAX];
-    int rc = copy_path_from_user(path, upath, sizeof(path));
+    int rc = make_path(path, upath);
     if (rc != 0) return rc;
 
     flags &= (VFS_O_ACCMODE | VFS_O_CREAT | VFS_O_TRUNC | VFS_O_APPEND);
@@ -258,10 +284,17 @@ static long sys_open(u64 upath, int flags) {
 
 static long sys_close(int fd) {
     task_t *t = current_task();
-    if (t && fd >= 3 && fd < VFS_MAX_FDS && t->socks[fd]) {
-        net_socket_close(t->socks[fd]);
-        t->socks[fd] = NULL;
-        return 0;
+    if (t && fd >= 3 && fd < VFS_MAX_FDS) {
+        if (t->socks[fd]) {
+            net_socket_close(t->socks[fd]);
+            t->socks[fd] = NULL;
+            return 0;
+        }
+        if (t->pipes[fd]) {
+            pipe_end_close(t->pipes[fd]);
+            t->pipes[fd] = NULL;
+            return 0;
+        }
     }
 
     vfs_file_t **files = current_files();
@@ -275,6 +308,33 @@ static long sys_read(int fd, u64 ubuf, u64 len) {
     if (len > USER_IO_MAX) return -EINVAL;
     if (len == 0) return 0;
 
+    task_t *t = current_task();
+    if (t && fd >= 0 && fd < VFS_MAX_FDS && t->pipes[fd]) {
+        char buf[512];
+        long n = pipe_read(t->pipes[fd], buf, MIN(len, (u64)sizeof(buf)));
+        if (n <= 0) return n;
+        if (copy_to_user((void *)(uptr)ubuf, buf, (u64)n) != 0) return -EFAULT;
+        return n;
+    }
+
+    vfs_file_t *f = fd_get(current_files(), fd);
+    if (f) {
+        char buf[512];
+        u64 done = 0;
+        while (done < len) {
+            u64 chunk = MIN(len - done, (u64)sizeof(buf));
+            long n = vfs_read(f, buf, chunk);
+            if (n < 0) return done ? (long)done : n;
+            if (n == 0) break;
+            if (copy_to_user((void *)(uptr)(ubuf + done), buf, (u64)n) != 0) {
+                return done ? (long)done : -EFAULT;
+            }
+            done += (u64)n;
+            if ((u64)n < chunk) break;
+        }
+        return (long)done;
+    }
+
     if (fd == 0) {
         char buf[256];
         long n = tty_read(buf, MIN(len, (u64)sizeof(buf)));
@@ -283,31 +343,30 @@ static long sys_read(int fd, u64 ubuf, u64 len) {
         return n;
     }
 
-    vfs_file_t *f = fd_get(current_files(), fd);
-    if (!f) return -EBADF;
-
-    char buf[512];
-    u64 done = 0;
-    while (done < len) {
-        u64 chunk = MIN(len - done, (u64)sizeof(buf));
-        long n = vfs_read(f, buf, chunk);
-        if (n < 0) return done ? (long)done : n;
-        if (n == 0) break;
-        if (copy_to_user((void *)(uptr)(ubuf + done), buf, (u64)n) != 0) {
-            return done ? (long)done : -EFAULT;
-        }
-        done += (u64)n;
-        if ((u64)n < chunk) break;
-    }
-    return (long)done;
+    return -EBADF;
 }
 
 static long sys_write(int fd, u64 ubuf, u64 len) {
     if (len > USER_IO_MAX) return -EINVAL;
 
-    if (fd == 1 || fd == 2) return console_write(ubuf, len);
+    task_t *t = current_task();
+    if (t && fd >= 0 && fd < VFS_MAX_FDS && t->pipes[fd]) {
+        char buf[512];
+        u64 done = 0;
+        while (done < len) {
+            u64 chunk = MIN(len - done, (u64)sizeof(buf));
+            if (copy_from_user(buf, (const void *)(uptr)(ubuf + done), chunk) != 0) {
+                return done ? (long)done : -EFAULT;
+            }
+            long n = pipe_write(t->pipes[fd], buf, chunk);
+            if (n < 0) return done ? (long)done : n;
+            done += (u64)n;
+        }
+        return (long)done;
+    }
 
     vfs_file_t *f = fd_get(current_files(), fd);
+    if (!f && (fd == 1 || fd == 2)) return console_write(ubuf, len);
     if (!f) return -EBADF;
 
     char buf[512];
@@ -328,7 +387,7 @@ static long sys_write(int fd, u64 ubuf, u64 len) {
 
 static long sys_stat(u64 upath, u64 ustat) {
     char path[VFS_PATH_MAX];
-    int rc = copy_path_from_user(path, upath, sizeof(path));
+    int rc = make_path(path, upath);
     if (rc != 0) return rc;
 
     vfs_stat_t st;
@@ -370,22 +429,313 @@ static long sys_getdents64(int fd, u64 ubuf, u64 len) {
 
 static long sys_unlink(u64 upath) {
     char path[VFS_PATH_MAX];
-    int rc = copy_path_from_user(path, upath, sizeof(path));
+    int rc = make_path(path, upath);
     if (rc != 0) return rc;
     return vfs_unlink(path);
 }
 
 static long sys_mkdir(u64 upath) {
     char path[VFS_PATH_MAX];
-    int rc = copy_path_from_user(path, upath, sizeof(path));
+    int rc = make_path(path, upath);
     if (rc != 0) return rc;
     return vfs_mkdir(path);
 }
 
+static long sys_chdir(u64 upath) {
+    char path[VFS_PATH_MAX];
+    int rc = make_path(path, upath);
+    if (rc != 0) return rc;
+
+    vfs_stat_t st;
+    rc = vfs_stat(path, &st);
+    if (rc != 0) return rc;
+    if (st.type != VFS_TYPE_DIR) return -ENOTDIR;
+
+    task_t *t = current_task();
+    if (!t) return -ESRCH;
+    strncpy(t->cwd, path, sizeof(t->cwd) - 1);
+    t->cwd[sizeof(t->cwd) - 1] = 0;
+    return 0;
+}
+
+static long sys_getcwd(u64 ubuf, u64 size) {
+    task_t *t = current_task();
+    if (!t || !ubuf) return -EINVAL;
+    usize n = strlen(t->cwd) + 1;
+    if (size < n) return -ERANGE;
+    if (copy_to_user((void *)(uptr)ubuf, t->cwd, n) != 0) return -EFAULT;
+    return (long)n;
+}
+
 static NORETURN void sys_exit(int status) {
     task_t *t = current_task();
-    if (t) kprintf("[user] pid %u (%s) exited, status %d\n", t->pid, t->name, status);
+    if (t) {
+        task_set_exit_status(status);
+        kprintf("[user] pid %u (%s) exited, status %d\n", t->pid, t->name, status);
+    }
     thread_exit();
+}
+
+/* ---- process control ----------------------------------------------- */
+
+static long sys_brk(u64 addr) {
+    task_t *t = current_task();
+    if (!t) return -ESRCH;
+    if (addr == 0) return (long)t->brk;
+    int rc = user_brk_set(t->pml4_phys, &t->brk, &t->brk_end, addr);
+    if (rc != 0) return rc;
+    return (long)t->brk;
+}
+
+static long sys_fork(syscall_frame_t *f) {
+    task_t *t = current_task();
+    if (!t || !t->pml4_phys) return -EINVAL;
+
+    u64 child_as = user_as_clone(t->pml4_phys);
+    if (!child_as) return -ENOMEM;
+
+    task_t *child = task_create_user_fork(t->name, f, child_as);
+    if (!child) {
+        user_as_destroy(child_as);
+        return -ENOMEM;
+    }
+    child->ppid = t->pid;
+    child->brk = t->brk;
+    child->brk_end = t->brk_end;
+    memcpy(child->cwd, t->cwd, sizeof(child->cwd));
+
+    /* The child shares the parent's open descriptors (like POSIX fork). */
+    for (int i = 0; i < VFS_MAX_FDS; i++) {
+        if (t->files[i]) {
+            t->files[i]->refs++;
+            child->files[i] = t->files[i];
+        }
+        if (t->socks[i]) {
+            net_socket_ref(t->socks[i]);
+            child->socks[i] = t->socks[i];
+        }
+        if (t->pipes[i]) {
+            pipe_end_ref(t->pipes[i]);
+            child->pipes[i] = t->pipes[i];
+        }
+    }
+    return (long)child->pid;
+}
+
+static int copy_user_str(char *dst, usize cap, u64 usrc) {
+    for (usize i = 0; i < cap; i++) {
+        if (copy_from_user(&dst[i], (const void *)(uptr)(usrc + i), 1) != 0) {
+            return -EFAULT;
+        }
+        if (dst[i] == 0) return 0;
+    }
+    return -ENAMETOOLONG;
+}
+
+static int copy_user_vec(char **kvec, int max, char *buf, usize cap, u64 uvec) {
+    if (!uvec) return 0;
+
+    usize used = 0;
+    int n = 0;
+    while (n < max) {
+        u64 ptr = 0;
+        if (copy_from_user(&ptr, (const void *)(uptr)(uvec + (u64)n * 8),
+                           sizeof(ptr)) != 0) {
+            return -EFAULT;
+        }
+        if (!ptr) break;
+        int rc = copy_user_str(buf + used, cap - used, ptr);
+        if (rc != 0) return rc;
+        kvec[n] = buf + used;
+        used += strlen(buf + used) + 1;
+        n++;
+    }
+    kvec[n] = NULL;
+    return n;
+}
+
+static long sys_execve(u64 upath, u64 uargv, u64 uenvp, syscall_frame_t *f) {
+    char path[VFS_PATH_MAX];
+    int rc = make_path(path, upath);
+    if (rc != 0) return rc;
+
+    vfs_file_t *vf = NULL;
+    rc = vfs_open(path, VFS_O_RDONLY, &vf);
+    if (rc != 0) return rc;
+
+    vfs_stat_t st;
+    rc = vfs_fstat(vf, &st);
+    if (rc != 0) { vfs_close(vf); return rc; }
+    if (st.type != VFS_TYPE_FILE || st.size < 64 || st.size > (4u << 20)) {
+        vfs_close(vf);
+        return -EINVAL;
+    }
+
+    u8 *image = kmalloc(st.size);
+    char *argbuf = kmalloc(2048);
+    char *envbuf = kmalloc(2048);
+    char *kargv[EXEC_MAX_VEC + 1];
+    char *kenvp[EXEC_MAX_VEC + 1];
+    if (!image || !argbuf || !envbuf) {
+        kfree(image); kfree(argbuf); kfree(envbuf);
+        vfs_close(vf);
+        return -ENOMEM;
+    }
+
+    u64 done = 0;
+    while (done < st.size) {
+        long n = vfs_read(vf, image + done, st.size - done);
+        if (n <= 0) break;
+        done += (u64)n;
+    }
+    vfs_close(vf);
+    if (done != st.size) {
+        kfree(image); kfree(argbuf); kfree(envbuf);
+        return -EIO;
+    }
+
+    rc = copy_user_vec(kargv, EXEC_MAX_VEC, argbuf, 2048, uargv);
+    if (rc < 0) goto out;
+    if (rc == 0) {
+        kargv[0] = path;
+        kargv[1] = NULL;
+    }
+    rc = copy_user_vec(kenvp, EXEC_MAX_VEC, envbuf, 2048, uenvp);
+    if (rc < 0) goto out;
+
+    u64 entry = 0, rsp = 0, new_as = 0;
+    rc = user_exec(image, st.size, kargv, kenvp, &entry, &rsp, &new_as);
+    if (rc != 0) goto out;
+
+    task_t *t = current_task();
+    u64 old_as = t->pml4_phys;
+
+    t->pml4_phys = new_as;
+    t->user_entry = entry;
+    t->user_stack_top = USER_STACK_TOP;
+    t->brk = user_brk_default();
+    t->brk_end = user_brk_default();
+    write_cr3(new_as);
+
+    f->user_rip = entry;
+    f->user_rsp = rsp;
+
+    if (old_as) user_as_destroy(old_as);
+    rc = 0;
+
+out:
+    kfree(image);
+    kfree(argbuf);
+    kfree(envbuf);
+    return rc;
+}
+
+static long sys_wait4(int pid, u64 ustatus, int options) {
+    UNUSED(options);
+    if (pid < 0) pid = 0;
+    int status = 0;
+    int rc = task_wait((u32)pid, &status);
+    if (rc < 0) return rc;
+    if (ustatus && copy_to_user((void *)(uptr)ustatus, &status,
+                                sizeof(status)) != 0) {
+        return -EFAULT;
+    }
+    return rc;
+}
+
+static long sys_getppid(void) {
+    task_t *t = current_task();
+    return t ? (long)t->ppid : -ESRCH;
+}
+
+/* ---- pipes and descriptor duplication ------------------------------ */
+
+static int fd_slot_free(task_t *t, int i) {
+    return !t->files[i] && !t->socks[i] && !t->pipes[i];
+}
+
+static void fd_copy(task_t *t, int from, int to) {
+    t->files[to] = t->files[from];
+    t->socks[to] = t->socks[from];
+    t->pipes[to] = t->pipes[from];
+
+    if (t->files[to]) t->files[to]->refs++;
+    else if (t->socks[to]) net_socket_ref(t->socks[to]);
+    else if (t->pipes[to]) pipe_end_ref(t->pipes[to]);
+}
+
+static void fd_close_slot(task_t *t, int fd) {
+    if (t->files[fd]) {
+        vfs_close(t->files[fd]);
+        t->files[fd] = NULL;
+    } else if (t->socks[fd]) {
+        net_socket_close(t->socks[fd]);
+        t->socks[fd] = NULL;
+    } else if (t->pipes[fd]) {
+        pipe_end_close(t->pipes[fd]);
+        t->pipes[fd] = NULL;
+    }
+}
+
+static long sys_pipe(u64 ufds) {
+    task_t *t = current_task();
+    if (!t || !ufds) return -EINVAL;
+
+    struct pipe_end *r = NULL;
+    struct pipe_end *w = NULL;
+    int rc = pipe_create(&r, &w);
+    if (rc != 0) return rc;
+
+    int fds[2] = { -1, -1 };
+    for (int i = 3; i < VFS_MAX_FDS && fds[1] < 0; i++) {
+        if (!fd_slot_free(t, i)) continue;
+        if (fds[0] < 0) fds[0] = i;
+        else fds[1] = i;
+    }
+    if (fds[1] < 0) {
+        pipe_end_close(r);
+        pipe_end_close(w);
+        return -ENFILE;
+    }
+
+    t->pipes[fds[0]] = r;
+    t->pipes[fds[1]] = w;
+
+    int out[2] = { fds[0], fds[1] };
+    if (copy_to_user((void *)(uptr)ufds, out, sizeof(out)) != 0) {
+        fd_close_slot(t, fds[0]);
+        fd_close_slot(t, fds[1]);
+        return -EFAULT;
+    }
+    return 0;
+}
+
+static long sys_dup(int oldfd) {
+    task_t *t = current_task();
+    if (!t || oldfd < 0 || oldfd >= VFS_MAX_FDS) return -EBADF;
+    if (fd_slot_free(t, oldfd)) return -EBADF;
+
+    for (int i = 3; i < VFS_MAX_FDS; i++) {
+        if (fd_slot_free(t, i)) {
+            fd_copy(t, oldfd, i);
+            return i;
+        }
+    }
+    return -ENFILE;
+}
+
+static long sys_dup2(int oldfd, int newfd) {
+    task_t *t = current_task();
+    if (!t || oldfd < 0 || oldfd >= VFS_MAX_FDS ||
+        newfd < 0 || newfd >= VFS_MAX_FDS) {
+        return -EBADF;
+    }
+    if (fd_slot_free(t, oldfd)) return -EBADF;
+    if (oldfd == newfd) return newfd;
+
+    fd_close_slot(t, newfd);
+    fd_copy(t, oldfd, newfd);
+    return newfd;
 }
 
 void syscall_handler(syscall_frame_t *f) {
@@ -463,8 +813,46 @@ void syscall_handler(syscall_frame_t *f) {
         __builtin_unreachable();
     case SYS_MMAP:
     case SYS_MUNMAP:
+        ret = -ENOSYS;
+        break;
     case SYS_BRK:
+        ret = sys_brk(f->rdi);
+        break;
     case SYS_IOCTL:
+        ret = -ENOSYS;
+        break;
+    case SYS_FORK:
+    case SYS_VFORK:
+        ret = sys_fork(f);
+        break;
+    case SYS_EXECVE:
+        ret = sys_execve(f->rdi, f->rsi, f->rdx, f);
+        break;
+    case SYS_WAIT4:
+        ret = sys_wait4((int)f->rdi, f->rsi, (int)f->rdx);
+        break;
+    case SYS_GETPPID:
+        ret = sys_getppid();
+        break;
+    case SYS_PIPE:
+        ret = sys_pipe(f->rdi);
+        break;
+    case SYS_DUP:
+        ret = sys_dup((int)f->rdi);
+        break;
+    case SYS_DUP2:
+        ret = sys_dup2((int)f->rdi, (int)f->rsi);
+        break;
+    case SYS_CHDIR:
+        ret = sys_chdir(f->rdi);
+        break;
+    case SYS_GETCWD:
+        ret = sys_getcwd(f->rdi, f->rsi);
+        break;
+    case SYS_RMDIR:
+        ret = sys_unlink(f->rdi);
+        break;
+    case SYS_KILL:
         ret = -ENOSYS;
         break;
     default:

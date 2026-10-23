@@ -65,6 +65,7 @@ typedef struct PACKED udp_hdr {
 
 struct net_socket {
     int used;
+    int refs;
     int type;
     u32 laddr;
     u32 raddr;
@@ -504,6 +505,7 @@ struct net_socket *net_socket_open(int type) {
         if (!g_socks[i].used) {
             memset(&g_socks[i], 0, sizeof(g_socks[i]));
             g_socks[i].used = 1;
+            g_socks[i].refs = 1;
             g_socks[i].type = type;
             return &g_socks[i];
         }
@@ -512,7 +514,16 @@ struct net_socket *net_socket_open(int type) {
 }
 
 void net_socket_close(struct net_socket *s) {
-    if (s) memset(s, 0, sizeof(*s));
+    if (!s) return;
+    if (s->refs > 1) {
+        s->refs--;
+        return;
+    }
+    memset(s, 0, sizeof(*s));
+}
+
+void net_socket_ref(struct net_socket *s) {
+    if (s) s->refs++;
 }
 
 static u16 ephemeral_port(void) {

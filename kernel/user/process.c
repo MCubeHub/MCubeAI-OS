@@ -209,45 +209,232 @@ int copy_to_user(void *udst, const void *src, u64 n) {
     return 0;
 }
 
-/* ---- init ---------------------------------------------------------- */
+/* ---- address-space cloning (fork) ---------------------------------- */
 
-int user_spawn_init(void) {
-    u64 pml4 = user_as_create();
-    if (!pml4) {
-        kprintf("[user] cannot allocate init address space\n");
-        return -ENOMEM;
+static int clone_table(u64 *src, u64 *dst, int level) {
+    for (u32 i = 0; i < 512; i++) {
+        u64 e = src[i];
+        if (!(e & PTE_PRESENT)) continue;
+
+        u64 phys = e & PTE_ADDR_MASK;
+        if (level == 1) {
+            if (e & PTE_HUGE) return -EINVAL;
+            u64 pa = pmm_alloc_page();
+            if (!pa) return -ENOMEM;
+            memcpy(phys_to_virt(pa), phys_to_virt(phys), PAGE_SIZE);
+            dst[i] = pa | (e & ~PTE_ADDR_MASK);
+            continue;
+        }
+
+        u64 child = pmm_alloc_page();
+        if (!child) return -ENOMEM;
+        memset(phys_to_virt(child), 0, PAGE_SIZE);
+        dst[i] = child | (e & ~PTE_ADDR_MASK);
+        int rc = clone_table(table_ptr(phys), table_ptr(child), level - 1);
+        if (rc != 0) return rc;
     }
+    return 0;
+}
+
+u64 user_as_clone(u64 src_pml4_phys) {
+    if (!src_pml4_phys) return 0;
+
+    u64 pml4_phys = user_as_create();
+    if (!pml4_phys) return 0;
+
+    u64 *src = table_ptr(src_pml4_phys);
+    u64 *dst = table_ptr(pml4_phys);
+    for (u32 i = 0; i < 256; i++) {
+        if (!(src[i] & PTE_PRESENT)) continue;
+        if (src[i] & PTE_HUGE) {
+            user_as_destroy(pml4_phys);
+            return 0;
+        }
+        u64 child = pmm_alloc_page();
+        if (!child) {
+            user_as_destroy(pml4_phys);
+            return 0;
+        }
+        memset(phys_to_virt(child), 0, PAGE_SIZE);
+        dst[i] = child | (src[i] & ~PTE_ADDR_MASK);
+        if (clone_table(table_ptr(src[i] & PTE_ADDR_MASK),
+                        table_ptr(child), 3) != 0) {
+            user_as_destroy(pml4_phys);
+            return 0;
+        }
+    }
+    return pml4_phys;
+}
+
+/* ---- exec: build a fresh image + argument stack --------------------- */
+
+#define EXEC_MAX_ARGS 32
+#define EXEC_MAX_ENVS 32
+
+typedef struct exec_stack {
+    u64 base;
+    u64 pages[USER_STACK_PAGES];
+    u64 top;
+} exec_stack_t;
+
+static u8 *stack_ptr(exec_stack_t *s, u64 va) {
+    u64 off = va - s->base;
+    u64 page = off / PAGE_SIZE;
+    if (page >= USER_STACK_PAGES) return NULL;
+    return (u8 *)phys_to_virt(s->pages[page]) + (off % PAGE_SIZE);
+}
+
+static int stack_write(exec_stack_t *s, u64 va, const void *src, u64 len) {
+    const u8 *p = (const u8 *)src;
+    while (len) {
+        u64 chunk = PAGE_SIZE - (va % PAGE_SIZE);
+        if (chunk > len) chunk = len;
+        u8 *dst = stack_ptr(s, va);
+        if (!dst) return -EFAULT;
+        memcpy(dst, p, chunk);
+        va += chunk;
+        p += chunk;
+        len -= chunk;
+    }
+    return 0;
+}
+
+static int stack_push_string(exec_stack_t *s, u64 *sp, const char *str, u64 *out) {
+    u64 len = strlen(str) + 1;
+    if (*sp < s->base + len) return -ENOMEM;
+    *sp -= len;
+    if (stack_write(s, *sp, str, len) != 0) return -EFAULT;
+    *out = *sp;
+    return 0;
+}
+
+static int stack_push_u64(exec_stack_t *s, u64 *sp, u64 value) {
+    if (*sp < s->base + sizeof(value)) return -ENOMEM;
+    *sp -= sizeof(value);
+    return stack_write(s, *sp, &value, sizeof(value));
+}
+
+int user_exec(const u8 *image, u64 size, char *const argv[], char *const envp[],
+              u64 *entry_out, u64 *rsp_out, u64 *pml4_out) {
+    u64 pml4 = user_as_create();
+    if (!pml4) return -ENOMEM;
 
     u64 entry = 0;
-    int rc = user_load_elf(pml4, user_init_elf, user_init_elf_size, &entry);
+    int rc = user_load_elf(pml4, image, size, &entry);
     if (rc != 0) {
-        kprintf("[user] cannot load init ELF (%d)\n", rc);
         user_as_destroy(pml4);
         return rc;
     }
 
+    exec_stack_t st;
+    st.base = USER_STACK_TOP - USER_STACK_PAGES * PAGE_SIZE;
+    st.top = USER_STACK_TOP;
     for (u64 i = 0; i < USER_STACK_PAGES; i++) {
         u64 pa = pmm_alloc_page();
         if (!pa) {
             user_as_destroy(pml4);
             return -ENOMEM;
         }
-        u64 va = USER_STACK_TOP - (i + 1) * PAGE_SIZE;
-        if (user_map(pml4, va, pa, PTE_WRITE | PTE_NX) != 0) {
+        st.pages[i] = pa;
+        if (user_map(pml4, st.base + i * PAGE_SIZE, pa, PTE_WRITE | PTE_NX) != 0) {
             pmm_free_page(pa);
             user_as_destroy(pml4);
             return -ENOMEM;
         }
     }
 
-    task_t *t = task_create_user("init", entry, USER_STACK_TOP - 8, pml4);
+    u64 argp[EXEC_MAX_ARGS];
+    u64 envp_addr[EXEC_MAX_ENVS];
+    int argc = 0, envc = 0;
+
+    while (argv && argv[argc] && argc < EXEC_MAX_ARGS) argc++;
+    while (envp && envp[envc] && envc < EXEC_MAX_ENVS) envc++;
+
+    u64 sp = st.top;
+    for (int i = envc - 1; i >= 0; i--) {
+        if (stack_push_string(&st, &sp, envp[i], &envp_addr[i]) != 0) {
+            user_as_destroy(pml4);
+            return -ENOMEM;
+        }
+    }
+    for (int i = argc - 1; i >= 0; i--) {
+        if (stack_push_string(&st, &sp, argv[i], &argp[i]) != 0) {
+            user_as_destroy(pml4);
+            return -ENOMEM;
+        }
+    }
+
+    sp = ALIGN_DOWN(sp, 16);
+    if (stack_push_u64(&st, &sp, 0) != 0) goto fail;          /* envp NULL */
+    for (int i = envc - 1; i >= 0; i--) {
+        if (stack_push_u64(&st, &sp, envp_addr[i]) != 0) goto fail;
+    }
+    if (stack_push_u64(&st, &sp, 0) != 0) goto fail;          /* argv NULL */
+    for (int i = argc - 1; i >= 0; i--) {
+        if (stack_push_u64(&st, &sp, argp[i]) != 0) goto fail;
+    }
+    if (stack_push_u64(&st, &sp, (u64)argc) != 0) goto fail;
+
+    *entry_out = entry;
+    *rsp_out = sp;
+    *pml4_out = pml4;
+    return 0;
+
+fail:
+    user_as_destroy(pml4);
+    return -ENOMEM;
+}
+
+/* ---- program break (brk) ------------------------------------------- */
+
+#define USER_HEAP_BASE 0x0000000001000000ULL   /* 16 MiB */
+#define USER_HEAP_LIMIT 0x0000000002000000ULL  /* 16 MiB of heap */
+
+u64 user_brk_default(void) { return USER_HEAP_BASE; }
+
+int user_brk_set(u64 pml4_phys, u64 *brk, u64 *brk_end, u64 addr) {
+    if (addr < USER_HEAP_BASE || addr > USER_HEAP_LIMIT) return -ENOMEM;
+    if (addr > *brk_end) {
+        u64 start = ALIGN_UP(*brk_end, PAGE_SIZE);
+        u64 end = ALIGN_UP(addr, PAGE_SIZE);
+        for (u64 va = start; va < end; va += PAGE_SIZE) {
+            u64 pa = pmm_alloc_page();
+            if (!pa) return -ENOMEM;
+            if (user_map(pml4_phys, va, pa, PTE_WRITE | PTE_NX) != 0) {
+                pmm_free_page(pa);
+                return -ENOMEM;
+            }
+        }
+        *brk_end = end;
+    }
+    *brk = addr;
+    return 0;
+}
+
+/* ---- init ---------------------------------------------------------- */
+
+int user_spawn_init(void) {
+    static char *argv[] = { "init", NULL };
+    static char *envp[] = { "PATH=/bin", "HOME=/", "USER=root", NULL };
+
+    u64 pml4 = 0, entry = 0, rsp = 0;
+    int rc = user_exec(user_init_elf, user_init_elf_size, argv, envp,
+                       &entry, &rsp, &pml4);
+    if (rc != 0) {
+        kprintf("[user] cannot load init ELF (%d)\n", rc);
+        return rc;
+    }
+
+    task_t *t = task_create_user("init", entry, rsp, pml4);
     if (!t) {
         user_as_destroy(pml4);
         return -ENOMEM;
     }
+    t->brk = user_brk_default();
+    t->brk_end = user_brk_default();
 
     kprintf("[user] init: %u-byte ELF, entry %p, stack %p, pml4 %p, pid %u\n",
-            (u32)user_init_elf_size, (void *)entry, (void *)USER_STACK_TOP,
+            (u32)user_init_elf_size, (void *)entry, (void *)rsp,
             (void *)pml4, t->pid);
     return 0;
 }

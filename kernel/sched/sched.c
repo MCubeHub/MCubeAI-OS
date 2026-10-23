@@ -14,6 +14,8 @@
 #include <mcube/percpu.h>
 #include <mcube/user.h>
 #include <mcube/net.h>
+#include <mcube/pipe.h>
+#include <mcube/syscall.h>
 
 #define KERNEL_STACK_SIZE (16 * 1024)
 #define IDLE_PID 0
@@ -21,6 +23,7 @@
 extern void context_switch(u64 *old_rsp, u64 new_rsp);
 extern void thread_entry_trampoline(void);
 extern void user_entry_trampoline(void);
+extern void syscall_return_tail(void);
 
 static task_t *g_current;
 static task_t *g_idle;
@@ -124,6 +127,8 @@ task_t *task_create_user(const char *name, u64 entry, u64 stack_top, u64 pml4_ph
     t->pml4_phys = pml4_phys;
     t->user_entry = entry;
     t->user_stack_top = stack_top;
+    t->cwd[0] = '/';
+    t->cwd[1] = 0;
     strncpy(t->name, name ? name : "user", sizeof(t->name) - 1);
 
     /* Initial kernel frame: context_switch pops these, then "returns" into
@@ -137,6 +142,65 @@ task_t *task_create_user(const char *name, u64 entry, u64 stack_top, u64 pml4_ph
     *--sp = entry;                /* r13 -> user rip  */
     *--sp = 0;                    /* r14              */
     *--sp = 0;                    /* r15              */
+    t->rsp = (u64)(uptr)sp;
+
+    task_list_add(t);
+    g_task_count++;
+    return t;
+}
+
+/* Fork: the child resumes exactly where the parent's `syscall` instruction
+ * returned, with the same user registers and stack. Build the kernel stack so
+ * that context_switch() lands in syscall_return_tail, which pops the saved
+ * frame and executes sysretq. */
+task_t *task_create_user_fork(const char *name, const struct syscall_frame *f,
+                              u64 pml4_phys) {
+    task_t *t = kzalloc(sizeof(task_t));
+    if (!t) return NULL;
+
+    void *stack = kmalloc(KERNEL_STACK_SIZE);
+    if (!stack) {
+        kfree(t);
+        return NULL;
+    }
+
+    t->kstack_base = (u64)(uptr)stack;
+    t->kstack_size = KERNEL_STACK_SIZE;
+    t->pid = g_next_pid++;
+    t->state = TASK_READY;
+    t->prio = 1;
+    t->ticks_left = SCHED_QUANTUM_TICKS;
+    t->flags = TASK_FLAG_USER;
+    t->pml4_phys = pml4_phys;
+    t->user_entry = f->user_rip;
+    t->user_stack_top = f->user_rsp;
+    t->cwd[0] = '/';
+    t->cwd[1] = 0;
+    strncpy(t->name, name ? name : "user", sizeof(t->name) - 1);
+
+    u64 top = ALIGN_DOWN((u64)(uptr)stack + KERNEL_STACK_SIZE, 16);
+    u64 *sp = (u64 *)top;
+
+    /* Tail of syscall_entry (highest slot first). */
+    *--sp = f->user_rsp;
+    *--sp = f->user_rip;          /* rcx */
+    *--sp = f->rflags;            /* r11 */
+    *--sp = 0;                    /* rax: fork() returns 0 in the child */
+    *--sp = f->rdi;
+    *--sp = f->rsi;
+    *--sp = f->rdx;
+    *--sp = f->r10;
+    *--sp = f->r8;
+    *--sp = f->r9;
+
+    /* context_switch() register frame (ret slot, then the six pops). */
+    *--sp = (u64)(uptr)syscall_return_tail;
+    *--sp = f->rbp;
+    *--sp = f->rbx;
+    *--sp = f->r12;
+    *--sp = f->r13;
+    *--sp = f->r14;
+    *--sp = f->r15;
     t->rsp = (u64)(uptr)sp;
 
     task_list_add(t);
@@ -180,11 +244,13 @@ static void reap_dead(void) {
     task_t *start = t;
     do {
         task_t *next = t->next;
-        if (t->state == TASK_DEAD && t != g_current && t != g_idle) {
+        if (t->state == TASK_DEAD && t != g_current && t != g_idle &&
+            (t->ppid == 0 || t->reaped)) {
             task_list_remove(t);
             if (g_task_count) g_task_count--;
             vfs_task_cleanup(t);
             net_task_cleanup(t);
+            pipe_task_cleanup(t);
             u64 stack = t->kstack_base;
             u64 pml4 = t->pml4_phys;
             kfree(t);
@@ -309,6 +375,35 @@ NORETURN void thread_exit(void) {
 task_t *current_task(void) { return g_current; }
 u32 task_count(void) { return g_task_count; }
 
+void task_set_exit_status(int status) {
+    if (g_current) g_current->exit_status = (u32)status;
+}
+
+int task_wait(u32 pid, int *status) {
+    task_t *me = g_current;
+    if (!me) return -ESRCH;
+
+    for (;;) {
+        int have_child = 0;
+        int found = 0;
+        task_t *t = g_tasks;
+        if (t) {
+            do {
+                if (t->ppid != me->pid) continue;
+                have_child = 1;
+                if (pid == 0 || t->pid == pid) found = 1;
+                if (t->state == TASK_DEAD && (pid == 0 || t->pid == pid)) {
+                    if (status) *status = (int)t->exit_status;
+                    t->reaped = 1;
+                    return (int)t->pid;
+                }
+            } while ((t = t->next) != g_tasks);
+        }
+        if (!have_child || !found) return -ECHILD;
+        task_sleep_ms(1);
+    }
+}
+
 void sched_start(void) {
     static u64 boot_rsp;
     g_active = 1;
@@ -328,8 +423,14 @@ void sched_start(void) {
 }
 
 void sched_dump(void) {
+    /* Traversal must not be preempted: reap_dead() may free a task that is
+     * still in the middle of the list while we walk it. */
+    u64 flags = irq_save();
     task_t *t = g_tasks;
-    if (!t) return;
+    if (!t) {
+        irq_restore(flags);
+        return;
+    }
     kprintf("[sched] tasks:\n");
     do {
         kprintf("  pid %-3u %-12s state %u prio %u ticks %u switches %u syscalls %u\n",
@@ -337,4 +438,5 @@ void sched_dump(void) {
                 (u32)t->total_ticks, (u32)t->switches, (u32)t->syscalls);
         t = t->next;
     } while (t != g_tasks);
+    irq_restore(flags);
 }

@@ -14,6 +14,7 @@ BITS 64
 section .text
 
 global syscall_entry
+global syscall_return_tail
 global user_entry_trampoline
 extern syscall_handler
 extern thread_exit
@@ -51,6 +52,7 @@ syscall_entry:
     pop     r12
     pop     rbp
     pop     rbx
+syscall_return_tail:
     pop     r9
     pop     r8
     pop     r10
@@ -71,6 +73,7 @@ user_entry_trampoline:
     mov     ax, 0x1b                    ; user data selector, RPL 3
     mov     ds, ax
     mov     es, ax
+    xor     eax, eax                    ; fork children see rax == 0
     push    qword 0x1b                  ; SS
     push    r12                         ; RSP
     push    qword 0x202                 ; RFLAGS: IF=1, reserved bit 1

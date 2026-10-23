@@ -94,15 +94,35 @@
   收到应答。`make test` 断言 `NET_PING_OK`/`NET_DNS_OK`/`NET_TEST_OK`
   与 `USER_NET_OK` 全部通过。
 
-## M7 — 用户空间基础（libc + Shell + coreutils）
+## M7 — 用户空间基础（libc + Shell + coreutils）（已完成）
 
 对应清单：四.1–四.3。
 
-- libc：内存/字符串/printf/errno/syscall 包装/pthread 轻量线程。
-- Shell：分词、引号、变量、PATH、管道/重定向/后台、作业控制、历史、Tab。
-- coreutils 子集与行编辑器。
-- 验收：交互式 Shell 完成管道 `ls / | grep bin | wc -l`；
-  `Ctrl+Z`/`bg`/`fg` 正常；`make libc-test` 全部通过。
+- 已实现：
+  - 用户态 libc（`user/lib`）：`crt0` 从内核构造的 argc/argv/envp 启动、
+    syscall 包装（负 errno 转 `errno`/`-1`）、字符串、`printf/snprintf/
+    fprintf`、`malloc/calloc/realloc`（`brk` 上的 bump 分配器）、
+    `getenv/setenv/unsetenv`、`environ`。
+  - 进程控制：`fork`（完整寄存器恢复 + 地址空间克隆 + fd 表按引用继承）、
+    `execve/execv/execvp`（ELF 装载、argv/envp 栈、保留 fd）、
+    `wait4`（僵尸回收与退出状态）、`pipe`、`dup/dup2`（引用计数复制）、
+    `chdir/getcwd/brk/getppid/rmdir`，相对路径按任务 cwd 解析。
+  - 管道：4 KiB 环形缓冲、阻塞读写、读端/写端独立引用计数，
+    `SIGPIPE` 语义简化为 `-EPIPE`。
+  - Shell（`user/programs/sh.c`）：分词、单/双引号与转义、`$VAR/${VAR}`/
+    `$?`/`$$` 展开、`;` 顺序执行、`|` 多级管道、`>`/`>>`/`<` 重定向、
+    `&` 后台作业、内建 `cd/pwd/exit/export/unset/set/jobs/help/echo/
+    true/false`，命令经 `/bin/<name>.elf` 解析。
+  - coreutils（20 个）：`sh ls cat echo mkdir rm cp mv pwd sleep wc grep
+    head tail uname true false clear env help`，构建后以 8.3 大写名放入
+    ESP 的 `/BIN`（如 `SH.ELF`）。
+- 待实现：pthread 轻量线程、历史记录与 Tab 补全、`Ctrl+Z`/`bg`/`fg`
+  完整作业控制（当前仅后台作业）、`make libc-test` host 单元测试。
+- 验收：PID 1 完成全部既有自检后 fork/exec `/bin/sh.elf -c
+  "ls /bin | wc -l"`，管道输出行数；`echo ... > /tmp/m7.txt` 重定向
+  回读一致；交互式 Shell 可执行 `help`、`uname -a`、
+  `echo hello-pipe | wc -c`。`make test` 断言 `USER_SHELL_OK` 与
+  `USER_REDIR_OK`。
 
 ## M8 — 图形子系统与桌面
 

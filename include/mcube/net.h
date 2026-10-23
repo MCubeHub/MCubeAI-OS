@@ -51,7 +51,7 @@ int  net_selftest(void);
  * socket state itself. Addresses are host-order u32. */
 struct net_socket *net_socket_open(int type);
 void net_socket_close(struct net_socket *s);
-int  net_socket_bind(struct net_socket *s, u32 ip, u16 port);
+void net_socket_ref(struct net_socket *s);int  net_socket_bind(struct net_socket *s, u32 ip, u16 port);
 int  net_socket_connect(struct net_socket *s, u32 ip, u16 port);
 int  net_socket_send(struct net_socket *s, const void *buf, u64 len);
 int  net_socket_sendto(struct net_socket *s, const void *buf, u64 len,
