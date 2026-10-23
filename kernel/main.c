@@ -16,6 +16,9 @@
 #include <mcube/mm.h>
 #include <mcube/timer.h>
 #include <mcube/sched.h>
+#include <mcube/percpu.h>
+#include <mcube/syscall.h>
+#include <mcube/user.h>
 
 #define MCUBE_VERSION "0.1.0"
 #define MCUBE_CODENAME "Genesis"
@@ -149,6 +152,7 @@ void kernel_main(boot_info_t *bi) {
 
     kprintf("[cpu] loading GDT + TSS...\n");
     gdt_init();
+    percpu_init();
     kprintf("[cpu] loading IDT (256 vectors) and remapping PIC...\n");
     idt_init();
     timer_init();
@@ -162,6 +166,8 @@ void kernel_main(boot_info_t *bi) {
         panic("memory self test failed");
     }
     kmalloc_dump_stats();
+
+    syscall_init();
 
     /* Timer acceptance: ticks must advance and a soft timer must fire. */
     g_soft_timer_fired = 0;
@@ -193,6 +199,9 @@ void kernel_main(boot_info_t *bi) {
     task_create("beta", sched_demo, (void *)"beta");
     task_create("gamma", sched_demo, (void *)"gamma");
     task_create("monitor", sched_monitor, NULL);
+    if (user_spawn_init() != 0) {
+        panic("cannot start user init");
+    }
     kprintf("[sched] starting kernel threads (RR, %u ms quantum)\n",
             SCHED_QUANTUM_TICKS);
     sched_start();

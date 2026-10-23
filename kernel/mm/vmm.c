@@ -1,12 +1,10 @@
 /* Virtual memory: page-table walking plus the kernel virtual arena.
  *
- * M2 still executes the kernel at its physical address (identity map created
- * by the loader). A dedicated high-half arena at VMALLOC_BASE is added for
- * slab pages and large heap allocations, giving us page-granular objects with
- * stable addresses independent of physical fragmentation.
- *
- * The higher-half kernel relocation lands in M2.5/M3; all code here uses
- * physical==virtual for page tables and the identity map for low memory.
+ * The kernel executes in the higher half; the loader also built a direct map
+ * at MCUBE_DIRECT_MAP_BASE so page tables can be accessed by physical
+ * address. A dedicated arena at VMALLOC_BASE backs slab pages and large heap
+ * allocations, giving us page-granular objects with stable addresses
+ * independent of physical fragmentation.
  */
 
 #include <mcube/mm.h>
@@ -54,6 +52,7 @@ void vmm_init(const boot_info_t *bi) {
 }
 
 u64 *vmm_kernel_pml4(void) { return g_pml4; }
+u64 vmm_kernel_pml4_phys(void) { return virt_to_phys(g_pml4); }
 
 void vmm_map_page(u64 va, u64 pa, u64 flags) {
     u64 *pdpt = next_table(g_pml4, PML4_INDEX(va), 1);
@@ -92,6 +91,31 @@ u64 vmm_translate(u64 va) {
     u64 *pt = table_from(pde);
     u64 pte = pt[PT_INDEX(va)];
     if (!(pte & PTE_PRESENT)) return 0;
+    return (pte & ADDR_MASK) | (va & 0xFFF);
+}
+
+/* Query an arbitrary address space. The kernel PML4 is shared by every
+ * process, so only the low half ever differs. */
+u64 vmm_query_in(u64 pml4_phys, u64 va) {
+    u64 *pml4 = (u64 *)phys_to_virt(pml4_phys);
+    u64 e = pml4[PML4_INDEX(va)];
+    if (!(e & PTE_PRESENT)) return 0;
+    u64 *pdpt = table_from(e);
+    e = pdpt[PDPT_INDEX(va)];
+    if (!(e & PTE_PRESENT)) return 0;
+    u64 *pd = table_from(e);
+    e = pd[PD_INDEX(va)];
+    if (!(e & PTE_PRESENT)) return 0;
+    if (e & PTE_HUGE) return e;
+    u64 *pt = table_from(e);
+    e = pt[PT_INDEX(va)];
+    return (e & PTE_PRESENT) ? e : 0;
+}
+
+u64 vmm_translate_in(u64 pml4_phys, u64 va) {
+    u64 pte = vmm_query_in(pml4_phys, va);
+    if (!pte) return 0;
+    if (pte & PTE_HUGE) return (pte & ~0x1FFFFFULL) | (va & 0x1FFFFFULL);
     return (pte & ADDR_MASK) | (va & 0xFFF);
 }
 

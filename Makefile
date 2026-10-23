@@ -50,6 +50,19 @@ KERNEL_ASM_SRCS := $(shell find kernel -name '*.asm' | sort)
 KERNEL_OBJS     := $(patsubst %.c,$(BUILD)/%.o,$(KERNEL_C_SRCS)) \
                    $(patsubst %.asm,$(BUILD)/%.o,$(KERNEL_ASM_SRCS))
 
+# User-space programs. The init ELF is embedded into the kernel image for
+# M4; once the VFS lands it will be read from the FAT32 ESP instead.
+USER_CFLAGS     := -std=gnu11 -O2 -Wall -Wextra -Werror -ffreestanding \
+                   -fno-stack-protector -fno-pic -fno-pie -mno-red-zone \
+                   -mno-sse -mno-sse2 -mno-mmx -fno-builtin -nostdlib -Iinclude
+USER_LDFLAGS    := -nostdlib -static -Wl,-T,user/user.ld \
+                   -Wl,--build-id=none -Wl,-z,max-page-size=4096 -Wl,-e,_start
+USER_OBJ        := $(BUILD)/user/init.o
+USER_ELF        := $(BUILD)/user/init.elf
+USER_BLOB_C     := $(BUILD)/generated/user_init_blob.c
+USER_BLOB_O     := $(BUILD)/generated/user_init_blob.o
+KERNEL_OBJS     += $(USER_BLOB_O)
+
 ESP_IMG         := $(BUILD)/esp.img
 KERNEL_ELF      := $(BUILD)/kernel.elf
 BOOT_EFI        := $(BUILD)/BOOTX64.EFI
@@ -77,6 +90,26 @@ $(BUILD)/%.o: %.asm
 	@mkdir -p $(dir $@)
 	$(NASM) -f elf64 -g -F dwarf -o $@ $<
 	@echo "  AS      $<"
+
+$(USER_OBJ): user/init.c user/user.ld include/mcube/syscall.h include/mcube/types.h
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c -o $@ $<
+	@echo "  UCC     $<"
+
+$(USER_ELF): $(USER_OBJ) user/user.ld
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_LDFLAGS) -o $@ $(USER_OBJ) $(LIBGCC)
+	@echo "  ULD     $@"
+
+$(USER_BLOB_C): $(USER_ELF) tools/gen_blob.py
+	@mkdir -p $(dir $@)
+	python3 tools/gen_blob.py user_init_elf $(USER_ELF) $@
+	@echo "  BLOB    $@"
+
+$(USER_BLOB_O): $(USER_BLOB_C) include/mcube/types.h
+	@mkdir -p $(dir $@)
+	$(CC) $(KERNEL_CFLAGS) -MMD -MP -c -o $@ $<
+	@echo "  CC      $<"
 
 $(BOOT_EFI): boot/loader.c boot/efi.h include/mcube/bootinfo.h include/mcube/types.h
 	@mkdir -p $(dir $@)
@@ -128,8 +161,11 @@ test: $(ESP_IMG)
 	@echo "--- serial log ---"
 	@cat $(SERIAL_LOG)
 	@grep -q "MCUBE_BOOT_OK" $(SERIAL_LOG) && grep -q "SCHED_TEST_OK" $(SERIAL_LOG) \
-	  && echo "TEST PASS: boot + scheduler markers found" \
-	  || (echo "TEST FAIL: boot/scheduler marker not found" && exit 1)
+	  && grep -q "USER_INIT_OK" $(SERIAL_LOG) \
+	  && grep -q "USER_EFAULT_OK" $(SERIAL_LOG) \
+	  && grep -q "USER_EINVAL_OK" $(SERIAL_LOG) \
+	  && echo "TEST PASS: boot + scheduler + user/syscall markers found" \
+	  || (echo "TEST FAIL: boot/scheduler/user marker not found" && exit 1)
 
 font:
 	python3 tools/gen_font.py

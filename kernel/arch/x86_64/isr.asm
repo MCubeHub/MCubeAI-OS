@@ -96,8 +96,27 @@ isr_common:
     push    r15
 
     cld
+
+    ; If the interrupted context was CPL3, switch GS to the kernel block.
+    ; CS sits at [rsp + 144] (15 saved regs + vector + error + rip).
+    test    byte [rsp + 144], 3
+    jz      .kernel_gs
+    swapgs
+.kernel_gs:
+
+    ; Keep the frame pointer in r15 (callee-saved, so it survives the call
+    ; and a context switch) and align the C stack independently.
     mov     rdi, rsp
+    mov     r15, rsp
+    and     rsp, -16
     call    isr_handler
+    mov     rsp, r15
+
+    ; Returning to CPL3: swap GS back to the user value.
+    test    byte [rsp + 144], 3
+    jz      .kernel_ret
+    swapgs
+.kernel_ret:
 
     pop     r15
     pop     r14

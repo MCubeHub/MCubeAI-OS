@@ -43,6 +43,13 @@ void vmm_map_page(u64 va, u64 pa, u64 flags);
 void vmm_unmap_page(u64 va);
 u64  vmm_translate(u64 va);
 u64 *vmm_kernel_pml4(void);
+u64  vmm_kernel_pml4_phys(void);
+
+/* Page-table queries against an arbitrary address space (used by the user
+ * loader and copy_*_user). vmm_query_in returns the leaf PTE (with flags) or
+ * 0 when not present; vmm_translate_in returns the physical address or 0. */
+u64  vmm_query_in(u64 pml4_phys, u64 va);
+u64  vmm_translate_in(u64 pml4_phys, u64 va);
 
 /* Kernel virtual arena used by the heap and later by vmalloc(). */
 u64  vmm_arena_alloc(u64 pages);

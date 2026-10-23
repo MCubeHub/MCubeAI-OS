@@ -11,12 +11,15 @@
 #include <mcube/mm.h>
 #include <mcube/io.h>
 #include <mcube/atomic.h>
+#include <mcube/percpu.h>
+#include <mcube/user.h>
 
 #define KERNEL_STACK_SIZE (16 * 1024)
 #define IDLE_PID 0
 
 extern void context_switch(u64 *old_rsp, u64 new_rsp);
 extern void thread_entry_trampoline(void);
+extern void user_entry_trampoline(void);
 
 static task_t *g_current;
 static task_t *g_idle;
@@ -100,6 +103,46 @@ task_t *task_create(const char *name, void (*entry)(void *), void *arg) {
     return t;
 }
 
+task_t *task_create_user(const char *name, u64 entry, u64 stack_top, u64 pml4_phys) {
+    task_t *t = kzalloc(sizeof(task_t));
+    if (!t) return NULL;
+
+    void *stack = kmalloc(KERNEL_STACK_SIZE);
+    if (!stack) {
+        kfree(t);
+        return NULL;
+    }
+
+    t->kstack_base = (u64)(uptr)stack;
+    t->kstack_size = KERNEL_STACK_SIZE;
+    t->pid = g_next_pid++;
+    t->state = TASK_READY;
+    t->prio = 1;
+    t->ticks_left = SCHED_QUANTUM_TICKS;
+    t->flags = TASK_FLAG_USER;
+    t->pml4_phys = pml4_phys;
+    t->user_entry = entry;
+    t->user_stack_top = stack_top;
+    strncpy(t->name, name ? name : "user", sizeof(t->name) - 1);
+
+    /* Initial kernel frame: context_switch pops these, then "returns" into
+     * user_entry_trampoline with r12 = user stack and r13 = user entry. */
+    u64 top = ALIGN_DOWN((u64)(uptr)stack + KERNEL_STACK_SIZE, 16);
+    u64 *sp = (u64 *)top;
+    *--sp = (u64)(uptr)user_entry_trampoline;
+    *--sp = 0;                    /* rbp              */
+    *--sp = 0;                    /* rbx              */
+    *--sp = stack_top;            /* r12 -> user rsp  */
+    *--sp = entry;                /* r13 -> user rip  */
+    *--sp = 0;                    /* r14              */
+    *--sp = 0;                    /* r15              */
+    t->rsp = (u64)(uptr)sp;
+
+    task_list_add(t);
+    g_task_count++;
+    return t;
+}
+
 void sched_init(void) {
     g_tasks = NULL;
     g_current = NULL;
@@ -140,8 +183,10 @@ static void reap_dead(void) {
             task_list_remove(t);
             if (g_task_count) g_task_count--;
             u64 stack = t->kstack_base;
+            u64 pml4 = t->pml4_phys;
             kfree(t);
             kfree((void *)(uptr)stack);
+            if (pml4) user_as_destroy(pml4);
         }
         t = next;
     } while (g_tasks && t != start);
@@ -166,6 +211,20 @@ void schedule(void) {
     next->switches++;
     g_current = next;
     g_need_resched = 0;
+
+    /* Program the per-CPU entry stack used by syscall and the TSS RSP0 used
+     * by interrupts taken from CPL3. Both must match the task we are about
+     * to run. */
+    percpu_t *pc = this_cpu();
+    u64 ktop = ALIGN_DOWN(next->kstack_base + next->kstack_size, 16);
+    pc->kernel_rsp = ktop;
+    pc->current = (u64)(uptr)next;
+    tss_set_rsp0(ktop);
+
+    /* Switch address space. Kernel mappings are shared, so the current
+     * stack and this function stay valid across the CR3 write. */
+    u64 want = next->pml4_phys ? next->pml4_phys : vmm_kernel_pml4_phys();
+    if (read_cr3() != want) write_cr3(want);
 
     context_switch(&prev->rsp, next->rsp);
     irq_restore(flags);
@@ -253,6 +312,14 @@ void sched_start(void) {
     g_current = g_idle;
     g_idle->state = TASK_RUNNING;
     g_idle->switches++;
+
+    percpu_t *pc = this_cpu();
+    u64 ktop = ALIGN_DOWN(g_idle->kstack_base + g_idle->kstack_size, 16);
+    pc->kernel_rsp = ktop;
+    pc->current = (u64)(uptr)g_idle;
+    tss_set_rsp0(ktop);
+    write_cr3(vmm_kernel_pml4_phys());
+
     context_switch(&boot_rsp, g_idle->rsp);
     panic("scheduler returned to boot context");
 }
@@ -262,9 +329,9 @@ void sched_dump(void) {
     if (!t) return;
     kprintf("[sched] tasks:\n");
     do {
-        kprintf("  pid %-3u %-12s state %u prio %u ticks %u switches %u\n",
+        kprintf("  pid %-3u %-12s state %u prio %u ticks %u switches %u syscalls %u\n",
                 t->pid, t->name, t->state, t->prio,
-                (u32)t->total_ticks, (u32)t->switches);
+                (u32)t->total_ticks, (u32)t->switches, (u32)t->syscalls);
         t = t->next;
     } while (t != g_tasks);
 }

@@ -32,11 +32,12 @@
 3. loader：从自身设备句柄打开 `\kernel.elf`，解析 ELF64，将每个 `PT_LOAD`
    段按 `p_paddr` 用 `AllocatePages(AllocateAddress)` 预留并拷贝。
 4. loader：分配 boot stack、Boot Info 页、内存图副本、页表。
-5. loader：建立 64 GiB 身份映射（2 MiB 大页），填好 Boot Info。
+5. loader：建立 64 GiB 身份映射、64 GiB direct map 与 2 GiB 内核窗口
+   （2 MiB 大页），填好 Boot Info。
 6. loader：`ExitBootServices`（失败则重取 map key 重试）。
-7. loader：写 CR3、置 CR0.WP，跳转 `kernel_main(boot_info*)`。
+7. loader：写 CR3、置 CR0.WP，跳转 `kernel_main(boot_info*)`（高半区）。
 8. kernel：早期 GDT → 串口/帧缓冲控制台 → 校验 Boot Info → 打印内存图
-   → GDT/TSS → IDT/PIC → 各子系统初始化 → idle。
+   → GDT/TSS → per-CPU/GS → IDT/PIC → 各子系统初始化 → idle。
 
 失败路径统一为「串口 + 屏幕打印错误码并 halt」，绝不静默重启。
 
@@ -49,10 +50,11 @@
 | direct map | `0xFFFF_8000_0000_0000 + phys` | 全部物理内存线性映射，内核分配器使用 |
 | vmalloc | `0xFFFF_C000_0000_0000 – 0xFFFF_CFFF_FFFF_FFFF` | 非连续内核映射 |
 | ioremap | `0xFFFF_D000_0000_0000 – 0xFFFF_DFFF_FFFF_FFFF` | MMIO，UC 属性 |
-| 内核映像 | `0xFFFF_FFFF_8000_0000` | higher-half，M2 从当前 2 MiB 身份映射迁移 |
+| 内核映像 | `0xFFFF_FFFF_8000_0000` | higher-half，物理装载于 2 MiB |
 
-M1 暂时使用低地址身份映射（内核链接在 2 MiB），M2 完成 higher-half 迁移后，
-所有内核代码/数据迁移到 `0xFFFF_FFFF_8000_0000`，物理页表同时保留 direct map。
+内核已运行在 higher-half。loader 同时保留低端身份映射供早期引导使用；
+用户进程的 PML4 只复制高半区（direct map、vmalloc、内核映像），低半区
+完全由进程私有页表填充，因此用户态看不到物理内存和内核数据。
 
 页表属性策略：
 - 内核代码 RX、只读数据 R、数据 RW、绝不同时 W+X。
@@ -78,9 +80,12 @@ M1 暂时使用低地址身份映射（内核链接在 2 MiB），M2 完成 high
 
 - x86_64：`syscall` 指令；号在 `rax`，参数 `rdi/rsi/rdx/r10/r8/r9`，
   返回值 `rax`，错误为负 errno（`-EFAULT` 等）。
-- 入口保存用户栈、切换内核栈（TSS.rsp0），`swapgs` 取每 CPU 数据。
+- 入口 `swapgs` 取 per-CPU 块，切到当前任务内核栈（TSS.rsp0 供中断使用），
+  保存用户 RIP/RSP/RFLAGS 后调用 C 分发表。
+- 返回使用 `sysretq`；用户选择子由 STAR 计算（CS=0x23、SS=0x1b，
+  RPL 3）。首次进入用户态用 `iretq` 构造完整帧。
 - 所有指针参数先做范围/权限检查，长度上限（如 `PATH_MAX=4096`），
-  禁止内核直接信任用户结构体。
+  统一走 `copy_from_user/copy_to_user`，禁止内核直接信任用户结构体。
 - `ai_*` 号段（`0x400` 起）：
   `ai_session_create/send/stream_read/cancel/tool_register/status/memory_*`。
 - 兼容层：AArch64 使用 `svc #0`，系统调用号表保持一致。

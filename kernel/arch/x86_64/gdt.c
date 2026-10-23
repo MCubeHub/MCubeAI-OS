@@ -63,10 +63,10 @@ void gdt_init(void) {
     g_gdt[1] = make_descriptor(0, 0xFFFFF, 0x9A, 0xA);
     /* 0x10 kernel data */
     g_gdt[2] = make_descriptor(0, 0xFFFFF, 0x92, 0xC);
-    /* 0x18 user code: DPL3 */
-    g_gdt[3] = make_descriptor(0, 0xFFFFF, 0xFA, 0xA);
-    /* 0x20 user data: DPL3 */
-    g_gdt[4] = make_descriptor(0, 0xFFFFF, 0xF2, 0xC);
+    /* 0x18 user data: DPL3. SYSRET computes SS = STAR[63:48] + 8. */
+    g_gdt[3] = make_descriptor(0, 0xFFFFF, 0xF2, 0xC);
+    /* 0x20 user code: DPL3. SYSRET computes CS = STAR[63:48] + 16. */
+    g_gdt[4] = make_descriptor(0, 0xFFFFF, 0xFA, 0xA);
     /* 0x28 TSS occupies entries 5 and 6 */
     g_gdt[5] = make_tss_descriptor((u64)(uptr)&g_tss, sizeof(g_tss) - 1);
     g_gdt[6] = (u64)(uptr)&g_tss >> 32;

@@ -11,6 +11,8 @@ enum task_state {
     TASK_DEAD,
 };
 
+#define TASK_FLAG_USER 0x1u
+
 typedef struct task {
     u64 rsp;                 /* saved kernel stack pointer (context_switch) */
     u64 kstack_base;
@@ -22,6 +24,12 @@ typedef struct task {
     u64 wake_tick;
     u64 total_ticks;
     u64 switches;
+    u64 syscalls;
+    u32 flags;               /* TASK_FLAG_* */
+    u32 pad;
+    u64 pml4_phys;           /* 0 = kernel address space */
+    u64 user_entry;
+    u64 user_stack_top;
     char name[24];
     struct task *next;
 } task_t;
@@ -30,6 +38,7 @@ void sched_init(void);
 void sched_start(void) NORETURN;
 
 task_t *task_create(const char *name, void (*entry)(void *), void *arg);
+task_t *task_create_user(const char *name, u64 entry, u64 stack_top, u64 pml4_phys);
 void schedule(void);
 void sched_tick(void);
 int  sched_need_resched(void);

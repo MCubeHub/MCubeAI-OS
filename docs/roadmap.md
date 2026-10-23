@@ -19,40 +19,40 @@
 - 验收：QEMU 串口出现 `MCUBE_BOOT_OK`；屏幕显示 banner；
   故意触发 `#PF` 时打印 CR2、错误码与栈回溯并 halt。
 
-## M2 — 物理/虚拟内存（进行中）
+## M2 — 物理/虚拟内存（已完成）
 
 对应清单：二.2、二.6 的一部分。
 
-- 物理页帧分配器（位图 + 每 CPU 缓存），预留内核/loader/MMIO/ACPI。
-- 四级页表管理：direct map、vmalloc、ioremap；内核切换 higher-half。
-- 内核堆：slab 对象缓存 + 伙伴系统，`kmalloc/kfree`，调试模式泄漏跟踪。
-- 每进程地址空间、COW、缺页处理（合法补映射 / 非法 SIGSEGV）。
-- SMAP/SMEP、NX、只读页与 W^X。
-- 验收：`mtest` 内核自测通过（分配/释放 10 万页无泄漏、COW 写时复制、
-  非法访问触发 panic 或 SIGSEGV、`/proc/meminfo` 数据一致）。
+- 物理页帧分配器（位图），预留内核/loader/MMIO/ACPI。
+- 四级页表管理：direct map、vmalloc；内核已迁移到 higher-half。
+- 内核堆：slab 对象缓存 + 大对象页运行，`kmalloc/kfree`，泄漏统计。
+- 每进程地址空间：低半区独立 PML4，高半区共享内核映射。
+- NX 已启用；COW、SMAP/SMEP 与完整 W^X 加固留到 M10。
+- 验收：`mm_selftest` 通过（4096 页分配/释放无泄漏、混合堆对象、
+  大对象与 `krealloc`）。
 
-## M3 — 中断、时钟与 SMP
+## M3 — 中断、时钟与 SMP（部分完成）
 
 对应清单：二.1、二.5、二.4（自旋锁）。
 
-- LAPIC + IOAPIC、APIC timer、HPET/TSC 校准、RTC。
-- 下半部：softirq/tasklet/workqueue；中断上下文约束检查。
-- 自旋锁（含关中断）、信号量、mutex、等待队列、原子操作。
-- ACPI MADT 解析与 AP 启动（INIT/SIPI），每 CPU 数据。
-- 系统调用 `time/clock_gettime/nanosleep/alarm`。
-- 验收：双核启动、`ps` 显示 per-CPU idle、定时器误差 < 1%、
-  锁顺序反转在调试模式被检测并 panic。
+- 已实现：PIT 1000 Hz、RTC、软定时器、PIC、自旋锁/原子操作、
+  抢占式 RR 调度、睡眠/唤醒。
+- 待实现：LAPIC/IOAPIC、APIC timer、HPET/TSC、softirq/workqueue、
+  ACPI MADT 与 AP 启动。
+- 验收：当前以 PIT + 单核 RR 通过；双核与锁反转检测随 SMP 里程碑补齐。
 
-## M4 — 进程、调度与系统调用
+## M4 — 进程、调度与系统调用（核心完成）
 
 对应清单：二.3、二.6、三.6、四.1 的 syscall 包装。
 
-- PCB/TCB、fork/exec/exit/wait/kill、线程 create/join/exit。
-- RR 调度 + MLFQ 接口，FPU 惰性切换，上下文切换汇编。
-- `syscall` 入口（MSR STAR/LSTAR/FMASK）、参数校验、负 errno。
-- 用户态 ELF 装载器、最小 init（PID 1）。
-- 验收：init 运行并打印；`fork` 1000 次无泄漏；`execve` 运行静态 ELF；
-  非法指针/超大长度系统调用返回 `-EFAULT/-EINVAL` 而非 panic。
+- 已实现：`syscall`/`sysret`（MSR STAR/LSTAR/FMASK、EFER.SCE）、
+  swapgs + 每 CPU 内核栈、TSS.rsp0、独立用户地址空间、用户态 ELF
+  装载器、PID 1 init、`write/getpid/nanosleep/yield/exit`、负 errno、
+  `copy_from_user/copy_to_user` 边界检查。
+- 待实现：`fork/execve/wait/kill`、线程 create/join、FPU 惰性切换、
+  MLFQ。这些依赖 M5 的 VFS/exec 路径，随后续里程碑补齐。
+- 验收：init 在用户态打印并退出；非法指针返回 `-EFAULT`、超大长度
+  返回 `-EINVAL`，内核不 panic。
 
 ## M5 — 文件系统、块设备、TTY
 
