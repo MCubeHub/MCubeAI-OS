@@ -73,7 +73,7 @@
 | VFS | `vfs_mount`、`vfs_inode`、`vfs_file`、`fat32_fs`/`fat32_node` | 最长前缀挂载，fd 表在 `task_t` |
 | 块层 | `block_device`、`fat32_fs` | ATA PIO 已接入，AHCI/NVMe 预留 |
 | 设备 | `device`、`driver`、`bus_type` | PCI/USB 匹配与电源状态 |
-| 网络 | `socket`、`sk_buff`、`net_device` | e1000 + IPv4 栈 |
+| 网络 | `net_device`、`net_socket`、ARP 表 | e1000（轮询）+ ARP/IPv4/ICMP/UDP/DNS |
 | AI 内核侧 | `ai_channel`、`ai_audit_event` | 共享内存环 + 审计队列 |
 
 ## 5. 系统调用 ABI
@@ -94,6 +94,11 @@
   是固定大小的共享 ABI 结构，内核侧对应 `vfs_stat_t`/`vfs_dirent_t`。
 - 文件描述符 0/1/2 保留给控制台；3..15 由每任务 fd 表分配。
   `read(0)` 从 TTY 环形队列取数据，空队列返回 `-EAGAIN`。
+- M6 已落地：`socket(41)/connect(42)/sendto(44)/recvfrom(45)/bind(49)`。
+  socket 与文件共用 fd 空间：`task_t->files[]` 存 VFS 句柄，
+  `task_t->socks[]` 存 socket 对象，分配时两者都为空才算空闲；
+  任务退出时 `net_task_cleanup()` 回收。地址结构 `mcube_sockaddr_in_t`
+  与 Linux `sockaddr_in` 线格式一致（网络字节序）。
 
 ## 6. 文件系统与设备模型
 
@@ -106,6 +111,10 @@
   请求合并、超时重试与统计随 AHCI/NVMe 一起补齐。
 - `/dev` 由 devfs 在挂载时提供固定设备节点；主/次设备号与权限位待扩展。
 - TTY 输入来自 PS/2 IRQ1 与 COM1 IRQ4；行规程、PTY 与控制台切换待实现。
+- 网络自底向上：PCI legacy 配置空间枚举 → e1000 MMIO 驱动
+  （32 项 RX/TX 环、IMS=0 纯轮询）→ `net_receive()` 分发 ARP/IPv4 →
+  ICMP/UDP/DNS。ARP 表 16 项，发送路径按掩码选择直连或网关。
+  TCP 在 M6.1 接入，DHCP/IPv6 随后。
 
 ## 7. AI 原生层接口
 

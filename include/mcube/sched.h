@@ -32,6 +32,7 @@ typedef struct task {
     u64 user_entry;
     u64 user_stack_top;
     struct vfs_file *files[VFS_MAX_FDS];
+    struct net_socket *socks[VFS_MAX_FDS];
     char name[24];
     struct task *next;
 } task_t;

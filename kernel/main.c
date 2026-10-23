@@ -22,6 +22,7 @@
 #include <mcube/block.h>
 #include <mcube/vfs.h>
 #include <mcube/tty.h>
+#include <mcube/net.h>
 
 #define MCUBE_VERSION "0.1.0"
 #define MCUBE_CODENAME "Genesis"
@@ -178,6 +179,15 @@ void kernel_main(boot_info_t *bi) {
         vfs_selftest();
     } else {
         kprintf("[vfs] filesystem self test skipped (root not mounted)\n");
+    }
+    /* The network self test waits for ARP/DNS replies with timer_sleep_ms(),
+     * which halts the CPU until the next PIT interrupt, so the tick source has
+     * to be live before the stack starts probing the gateway. */
+    cpu_sti();
+    if (net_init() == 0) {
+        net_selftest();
+    } else {
+        kprintf("[net] network self test skipped (no device)\n");
     }
 
     /* Timer acceptance: ticks must advance and a soft timer must fire. */

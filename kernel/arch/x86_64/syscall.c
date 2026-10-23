@@ -14,6 +14,7 @@
 #include <mcube/timer.h>
 #include <mcube/vfs.h>
 #include <mcube/tty.h>
+#include <mcube/net.h>
 
 /* Selectors: kernel code 0x08, kernel data 0x10, user data 0x18, user code
  * 0x20. STAR encodes both the syscall and sysret pairs. */
@@ -57,8 +58,9 @@ static vfs_file_t **current_files(void) {
 
 static int fd_alloc(vfs_file_t **files, vfs_file_t *f) {
     if (!files) return -ESRCH;
+    task_t *t = current_task();
     for (int i = 3; i < VFS_MAX_FDS; i++) {
-        if (!files[i]) {
+        if (!files[i] && !(t && t->socks[i])) {
             files[i] = f;
             return i;
         }
@@ -69,6 +71,149 @@ static int fd_alloc(vfs_file_t **files, vfs_file_t *f) {
 static vfs_file_t *fd_get(vfs_file_t **files, int fd) {
     if (!files || fd < 3 || fd >= VFS_MAX_FDS) return NULL;
     return files[fd];
+}
+
+/* ---- sockets ------------------------------------------------------- */
+
+static struct net_socket *sock_get(int fd) {
+    task_t *t = current_task();
+    if (!t || fd < 3 || fd >= VFS_MAX_FDS) return NULL;
+    return t->socks[fd];
+}
+
+static int fd_alloc_socket(struct net_socket *s) {
+    task_t *t = current_task();
+    if (!t) return -ESRCH;
+    for (int i = 3; i < VFS_MAX_FDS; i++) {
+        if (!t->files[i] && !t->socks[i]) {
+            t->socks[i] = s;
+            return i;
+        }
+    }
+    return -ENFILE;
+}
+
+static u32 be32_to_host(u32 v) {
+    return ((v & 0xFFu) << 24) | ((v & 0xFF00u) << 8) |
+           ((v >> 8) & 0xFF00u) | ((v >> 24) & 0xFFu);
+}
+
+static u16 be16_to_host(u16 v) {
+    return (u16)((v >> 8) | (v << 8));
+}
+
+static u32 host_to_be32(u32 v) { return be32_to_host(v); }
+static u16 host_to_be16(u16 v) { return be16_to_host(v); }
+
+static int sockaddr_from_user(u64 uaddr, u64 addrlen, u32 *ip, u16 *port) {
+    mcube_sockaddr_in_t sa;
+    if (!uaddr) return -EINVAL;
+    if (addrlen < sizeof(sa)) return -EINVAL;
+    if (copy_from_user(&sa, (const void *)(uptr)uaddr, sizeof(sa)) != 0) {
+        return -EFAULT;
+    }
+    if (sa.sin_family != AF_INET) return -EAFNOSUPPORT;
+    *ip = be32_to_host(sa.sin_addr);
+    *port = be16_to_host(sa.sin_port);
+    return 0;
+}
+
+static long sys_socket(int domain, int type, int protocol) {
+    UNUSED(protocol);
+    if (domain != AF_INET) return -EAFNOSUPPORT;
+    if (type != SOCK_DGRAM && type != SOCK_STREAM) return -EPROTONOSUPPORT;
+
+    struct net_socket *s = net_socket_open(type);
+    if (!s) return -ENFILE;
+
+    int fd = fd_alloc_socket(s);
+    if (fd < 0) {
+        net_socket_close(s);
+        return fd;
+    }
+    return fd;
+}
+
+static long sys_bind(int fd, u64 uaddr, u64 addrlen) {
+    struct net_socket *s = sock_get(fd);
+    if (!s) return -ENOTSOCK;
+
+    u32 ip;
+    u16 port;
+    int rc = sockaddr_from_user(uaddr, addrlen, &ip, &port);
+    if (rc != 0) return rc;
+    return net_socket_bind(s, ip, port);
+}
+
+static long sys_connect(int fd, u64 uaddr, u64 addrlen) {
+    struct net_socket *s = sock_get(fd);
+    if (!s) return -ENOTSOCK;
+
+    u32 ip;
+    u16 port;
+    int rc = sockaddr_from_user(uaddr, addrlen, &ip, &port);
+    if (rc != 0) return rc;
+    return net_socket_connect(s, ip, port);
+}
+
+static long sys_sendto(int fd, u64 ubuf, u64 len, u64 uaddr, u64 addrlen) {
+    struct net_socket *s = sock_get(fd);
+    if (!s) return -ENOTSOCK;
+    if (len > NET_MTU - 8 - 20) return -EINVAL;
+
+    u32 ip = 0;
+    u16 port = 0;
+    if (uaddr) {
+        int rc = sockaddr_from_user(uaddr, addrlen, &ip, &port);
+        if (rc != 0) return rc;
+    }
+
+    u8 kbuf[NET_MTU];
+    if (len && copy_from_user(kbuf, (const void *)(uptr)ubuf, len) != 0) {
+        return -EFAULT;
+    }
+
+    int rc;
+    if (uaddr) rc = net_socket_sendto(s, kbuf, len, ip, port);
+    else       rc = net_socket_send(s, kbuf, len);
+    return rc;
+}
+
+static long sys_recvfrom(int fd, u64 ubuf, u64 len, u64 uaddr, u64 uaddrlen) {
+    struct net_socket *s = sock_get(fd);
+    if (!s) return -ENOTSOCK;
+    if (len > USER_IO_MAX) return -EINVAL;
+
+    u8 kbuf[NET_MTU];
+    u64 want = MIN(len, (u64)sizeof(kbuf));
+    u32 ip = 0;
+    u16 port = 0;
+
+    int rc = net_socket_recvfrom(s, kbuf, want, &ip, &port);
+    if (rc < 0) return rc;
+    if (copy_to_user((void *)(uptr)ubuf, kbuf, (u64)rc) != 0) return -EFAULT;
+
+    if (uaddr) {
+        u32 alen = 0;
+        if (copy_from_user(&alen, (const void *)(uptr)uaddrlen, sizeof(alen)) != 0) {
+            return -EFAULT;
+        }
+        if (alen >= sizeof(mcube_sockaddr_in_t)) {
+            mcube_sockaddr_in_t sa;
+            memset(&sa, 0, sizeof(sa));
+            sa.sin_family = AF_INET;
+            sa.sin_port = host_to_be16(port);
+            sa.sin_addr = host_to_be32(ip);
+            if (copy_to_user((void *)(uptr)uaddr, &sa, sizeof(sa)) != 0) {
+                return -EFAULT;
+            }
+            alen = sizeof(sa);
+            if (copy_to_user((void *)(uptr)uaddrlen, &alen, sizeof(alen)) != 0) {
+                return -EFAULT;
+            }
+        }
+    }
+    return rc;
 }
 
 /* ---- console ------------------------------------------------------- */
@@ -112,6 +257,13 @@ static long sys_open(u64 upath, int flags) {
 }
 
 static long sys_close(int fd) {
+    task_t *t = current_task();
+    if (t && fd >= 3 && fd < VFS_MAX_FDS && t->socks[fd]) {
+        net_socket_close(t->socks[fd]);
+        t->socks[fd] = NULL;
+        return 0;
+    }
+
     vfs_file_t **files = current_files();
     vfs_file_t *f = fd_get(files, fd);
     if (!f) return -EBADF;
@@ -262,6 +414,25 @@ void syscall_handler(syscall_frame_t *f) {
         break;
     case SYS_GETDENTS64:
         ret = sys_getdents64((int)f->rdi, f->rsi, f->rdx);
+        break;
+    case SYS_SOCKET:
+        ret = sys_socket((int)f->rdi, (int)f->rsi, (int)f->rdx);
+        break;
+    case SYS_BIND:
+        ret = sys_bind((int)f->rdi, f->rsi, f->rdx);
+        break;
+    case SYS_CONNECT:
+        ret = sys_connect((int)f->rdi, f->rsi, f->rdx);
+        break;
+    case SYS_SENDTO:
+        ret = sys_sendto((int)f->rdi, f->rsi, f->rdx, f->r8, f->r9);
+        break;
+    case SYS_RECVFROM:
+        ret = sys_recvfrom((int)f->rdi, f->rsi, f->rdx, f->r8, f->r9);
+        break;
+    case SYS_SETSOCKOPT:
+    case SYS_GETSOCKOPT:
+        ret = -EOPNOTSUPP;
         break;
     case SYS_MKDIR:
         ret = sys_mkdir(f->rdi);

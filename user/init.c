@@ -18,6 +18,19 @@ static long sys3(long n, long a, long b, long c) {
     return r;
 }
 
+static long sys6(long n, long a, long b, long c, long d, long e, long f) {
+    register long r10 __asm__("r10") = d;
+    register long r8  __asm__("r8")  = e;
+    register long r9  __asm__("r9")  = f;
+    long r;
+    __asm__ __volatile__("syscall"
+                         : "=a"(r)
+                         : "a"(n), "D"(a), "S"(b), "d"(c),
+                           "r"(r10), "r"(r8), "r"(r9)
+                         : "rcx", "r11", "cc", "memory");
+    return r;
+}
+
 static long sys1(long n, long a) { return sys3(n, a, 0, 0); }
 static long sys0(long n) { return sys3(n, 0, 0, 0); }
 
@@ -111,6 +124,56 @@ void _start(void) {
         const char *msg = "USER_TTY_OK\n";
         sys3(SYS_WRITE, tfd, (long)msg, (long)slen(msg));
         sys3(SYS_CLOSE, tfd, 0, 0);
+    }
+
+    /* BSD socket path: ask the user-mode gateway DNS server to resolve a
+     * name. This exercises socket/bind/sendto/recvfrom/close end to end. */
+    long sfd = sys3(SYS_SOCKET, AF_INET, SOCK_DGRAM, 0);
+    if (sfd >= 3) {
+        u8 query[32];
+        u64 qlen = 0;
+        const u8 hdr[12] = { 0x4D, 0x43, 0x01, 0x00, 0x00, 0x01,
+                             0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+        for (int i = 0; i < 12; i++) query[qlen++] = hdr[i];
+        const char *name = "example.com";
+        while (*name) {
+            const char *dot = name;
+            while (*dot && *dot != '.') dot++;
+            query[qlen++] = (u8)(dot - name);
+            while (name < dot) query[qlen++] = (u8)*name++;
+            if (*dot == '.') name = dot + 1;
+        }
+        query[qlen++] = 0;
+        query[qlen++] = 0; query[qlen++] = 1;
+        query[qlen++] = 0; query[qlen++] = 1;
+
+        mcube_sockaddr_in_t sa;
+        for (u64 i = 0; i < sizeof(sa); i++) ((u8 *)&sa)[i] = 0;
+        sa.sin_family = AF_INET;
+        sa.sin_port = (u16)((53 >> 8) | (53 << 8));
+        sa.sin_addr = 10u | (0u << 8) | (2u << 16) | (3u << 24);
+
+        long sent = sys6(SYS_SENDTO, sfd, (long)query, (long)qlen,
+                         0, (long)&sa, (long)sizeof(sa));
+        int ok = 0;
+        if (sent == (long)qlen) {
+            u8 reply[256];
+            mcube_sockaddr_in_t from;
+            for (int tries = 0; tries < 100; tries++) {
+                u32 alen = sizeof(from);
+                long n = sys6(SYS_RECVFROM, sfd, (long)reply,
+                              (long)sizeof(reply), 0, (long)&from,
+                              (long)&alen);
+                if (n > 12) {
+                    ok = (reply[0] == 0x4D && reply[1] == 0x43);
+                    break;
+                }
+                sys1(SYS_NANOSLEEP, 5);
+            }
+        }
+        sys3(SYS_CLOSE, sfd, 0, 0);
+        if (ok) swrite("USER_NET_OK\n");
+        else swrite("USER_NET_FAIL\n");
     }
 
     sys1(SYS_NANOSLEEP, 40);

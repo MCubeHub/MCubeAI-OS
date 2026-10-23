@@ -13,6 +13,7 @@
 #include <mcube/atomic.h>
 #include <mcube/percpu.h>
 #include <mcube/user.h>
+#include <mcube/net.h>
 
 #define KERNEL_STACK_SIZE (16 * 1024)
 #define IDLE_PID 0
@@ -183,6 +184,7 @@ static void reap_dead(void) {
             task_list_remove(t);
             if (g_task_count) g_task_count--;
             vfs_task_cleanup(t);
+            net_task_cleanup(t);
             u64 stack = t->kstack_base;
             u64 pml4 = t->pml4_phys;
             kfree(t);

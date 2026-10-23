@@ -27,11 +27,34 @@
 #define SYS_YIELD     24
 #define SYS_NANOSLEEP 35
 #define SYS_GETPID    39
+#define SYS_SOCKET    41
+#define SYS_CONNECT   42
+#define SYS_SENDTO    44
+#define SYS_RECVFROM  45
+#define SYS_BIND      49
 #define SYS_EXIT      60
 #define SYS_MKDIR     83
 #define SYS_UNLINK    87
 #define SYS_GETTID    186
 #define SYS_GETDENTS64 217
+#define SYS_SETSOCKOPT 54
+#define SYS_GETSOCKOPT 55
+
+/* Socket constants mirrored from <mcube/net.h> so user programs only need
+ * this header. Identical values make the duplicate definitions harmless. */
+#ifndef AF_INET
+#define AF_INET      2
+#define SOCK_STREAM  1
+#define SOCK_DGRAM   2
+#endif
+
+/* BSD socket address, wire layout identical to Linux sockaddr_in. */
+typedef struct PACKED mcube_sockaddr_in {
+    u16 sin_family;
+    u16 sin_port;   /* network byte order */
+    u32 sin_addr;   /* network byte order */
+    u8  sin_zero[8];
+} mcube_sockaddr_in_t;
 
 /* Fixed-size stat and directory records shared with user space. These match
  * vfs_stat_t / vfs_dirent_t in <mcube/vfs.h>. */
@@ -68,11 +91,21 @@ typedef struct PACKED mcube_dirent {
 #define EISDIR   21
 #define EINVAL   22
 #define ENFILE   23
+#define ENOTTY   25
 #define ENOSPC   28
 #define ESPIPE   29
 #define ENAMETOOLONG 36
 #define ENOSYS   38
 #define ENOTEMPTY 39
+#define ENOTSOCK 88
+#define EPROTONOSUPPORT 93
+#define EOPNOTSUPP 95
+#define EAFNOSUPPORT 97
+#define EADDRINUSE 98
+#define ENOTCONN 107
+#define ETIMEDOUT 110
+#define ECONNREFUSED 111
+#define EHOSTUNREACH 113
 
 /* Saved register frame built by kernel/arch/x86_64/syscall.asm.
  * The C handler may only write `nr` (the return slot). */

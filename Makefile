@@ -24,6 +24,7 @@ QEMU_MACHINE    ?= pc
 QEMU_MEM        ?= 512M
 QEMU_CPUS       ?= 1
 QEMU_ACCEL      ?= tcg
+QEMU_NET        ?= -netdev user,id=net0 -device e1000,netdev=net0
 RUN_TIMEOUT     ?= 20
 
 OVMF_CODE       ?= /usr/share/OVMF/OVMF_CODE_4M.fd
@@ -133,7 +134,7 @@ run: $(ESP_IMG)
 	  -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 	  -drive if=pflash,format=raw,file=$(BUILD)/OVMF_VARS.fd \
 	  -drive file=$(ESP_IMG),format=raw,if=ide \
-	  -serial stdio -display none -no-reboot -net none
+	  -serial stdio -display none -no-reboot $(QEMU_NET)
 
 run-gui: $(ESP_IMG)
 	@cp -f $(OVMF_VARS) $(BUILD)/OVMF_VARS.fd
@@ -141,7 +142,7 @@ run-gui: $(ESP_IMG)
 	  -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 	  -drive if=pflash,format=raw,file=$(BUILD)/OVMF_VARS.fd \
 	  -drive file=$(ESP_IMG),format=raw,if=ide \
-	  -serial file:$(SERIAL_LOG) -display gtk -no-reboot -net none
+	  -serial file:$(SERIAL_LOG) -display gtk -no-reboot $(QEMU_NET)
 
 debug: $(ESP_IMG)
 	@cp -f $(OVMF_VARS) $(BUILD)/OVMF_VARS.fd
@@ -149,7 +150,7 @@ debug: $(ESP_IMG)
 	  -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 	  -drive if=pflash,format=raw,file=$(BUILD)/OVMF_VARS.fd \
 	  -drive file=$(ESP_IMG),format=raw,if=ide \
-	  -serial file:$(SERIAL_LOG) -display none -no-reboot -net none -s -S
+	  -serial file:$(SERIAL_LOG) -display none -no-reboot $(QEMU_NET) -s -S
 
 test: $(ESP_IMG)
 	@cp -f $(OVMF_VARS) $(BUILD)/OVMF_VARS.fd
@@ -158,11 +159,14 @@ test: $(ESP_IMG)
 	  -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 	  -drive if=pflash,format=raw,file=$(BUILD)/OVMF_VARS.fd \
 	  -drive file=$(ESP_IMG),format=raw,if=ide \
-	  -serial file:$(SERIAL_LOG) -display none -no-reboot -net none || true
+	  -serial file:$(SERIAL_LOG) -display none -no-reboot $(QEMU_NET) || true
 	@echo "--- serial log ---"
 	@cat $(SERIAL_LOG)
 	@grep -q "MCUBE_BOOT_OK" $(SERIAL_LOG) && grep -q "SCHED_TEST_OK" $(SERIAL_LOG) \
 	  && grep -q "VFS_TEST_OK" $(SERIAL_LOG) \
+	  && grep -q "NET_PING_OK" $(SERIAL_LOG) \
+	  && grep -q "NET_DNS_OK" $(SERIAL_LOG) \
+	  && grep -q "NET_TEST_OK" $(SERIAL_LOG) \
 	  && grep -q "USER_INIT_OK" $(SERIAL_LOG) \
 	  && grep -q "USER_EFAULT_OK" $(SERIAL_LOG) \
 	  && grep -q "USER_EINVAL_OK" $(SERIAL_LOG) \
@@ -170,8 +174,9 @@ test: $(ESP_IMG)
 	  && grep -q "USER_DIR_OK" $(SERIAL_LOG) \
 	  && grep -q "USER_STAT_OK" $(SERIAL_LOG) \
 	  && grep -q "USER_TTY_OK" $(SERIAL_LOG) \
-	  && echo "TEST PASS: boot + scheduler + VFS + user/syscall markers found" \
-	  || (echo "TEST FAIL: boot/scheduler/VFS/user marker not found" && exit 1)
+	  && grep -q "USER_NET_OK" $(SERIAL_LOG) \
+	  && echo "TEST PASS: boot + scheduler + VFS + net + user/syscall markers found" \
+	  || (echo "TEST FAIL: boot/scheduler/VFS/net/user marker not found" && exit 1)
 
 font:
 	python3 tools/gen_font.py

@@ -74,14 +74,25 @@
   写入回读、`/dev/zero`；init 读取 `/TEST.TXT`、枚举 `/`、`stat`
   内核 ELF，并经 `/dev/ttyS0` 输出。`make test` 断言全部通过。
 
-## M6 — 网络
+## M6 — 网络（核心完成）
 
 对应清单：三.4。
 
-- e1000 驱动、ARP/IPv4/ICMP/UDP/TCP（简化可靠传输）。
-- socket/bind/connect/listen/accept/send/recv、DNS 解析。
-- 验收：`ping 10.0.2.2` 通；TCP echo 回环与跨 QEMU 主机通；
-  `ifconfig` 显示正确 MAC/IP/统计。
+- 已实现：
+  - PCI legacy 配置空间枚举、BAR 解码、bus-master 使能。
+  - Intel 8254x（e1000，QEMU 82540EM）轮询驱动：MMIO BAR、复位、
+    RX/TX 描述符环、MAC 读取、link 状态；IMS=0，不依赖 PCI IRQ 路由。
+  - 协议栈：Ethernet/ARP/IPv4/ICMP echo/UDP/DNS（A 记录解析）。
+  - BSD socket：`socket/bind/connect/sendto/recvfrom/send/recv/close`；
+    socket 与文件共用 fd 空间（`task_t->socks[]`），任务退出自动回收。
+  - 系统调用：`socket(41)/connect(42)/sendto(44)/recvfrom(45)/bind(49)`，
+    `sockaddr_in` 使用 Linux 线格式；TCP 返回 `-ENOSYS`。
+- 待实现：TCP（握手/重传/窗口）、DHCP、IPv6、路由表、多网卡、
+  RX 中断与 NAPI 式批量回收、`setsockopt/getsockopt`。
+- 验收：QEMU user 网络下 ARP 到 `10.0.2.2`、ICMP echo、DNS 解析
+  `example.com`；init 在用户态用 UDP socket 向 `10.0.2.3:53` 查询并
+  收到应答。`make test` 断言 `NET_PING_OK`/`NET_DNS_OK`/`NET_TEST_OK`
+  与 `USER_NET_OK` 全部通过。
 
 ## M7 — 用户空间基础（libc + Shell + coreutils）
 
