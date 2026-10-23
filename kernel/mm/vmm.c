@@ -26,7 +26,7 @@ static u8   g_arena_bitmap[ARENA_PAGES / 8];
 static u64  g_arena_used;
 
 static inline u64 *table_from(u64 entry) {
-    return (u64 *)(uptr)(entry & ADDR_MASK);
+    return (u64 *)phys_to_virt(entry & ADDR_MASK);
 }
 
 static u64 *next_table(u64 *table, u64 index, int create) {
@@ -34,13 +34,13 @@ static u64 *next_table(u64 *table, u64 index, int create) {
     if (!create) return NULL;
     u64 phys = pmm_alloc_page();
     if (!phys) return NULL;
-    memset((void *)(uptr)phys, 0, PAGE_SIZE);
+    memset(phys_to_virt(phys), 0, PAGE_SIZE);
     table[index] = phys | PTE_PRESENT | PTE_WRITE;
-    return (u64 *)(uptr)phys;
+    return (u64 *)phys_to_virt(phys);
 }
 
 void vmm_init(const boot_info_t *bi) {
-    g_pml4 = (u64 *)(uptr)bi->pml4_phys;
+    g_pml4 = (u64 *)phys_to_virt(bi->pml4_phys);
     memset(g_arena_bitmap, 0, sizeof(g_arena_bitmap));
     g_arena_used = 0;
 

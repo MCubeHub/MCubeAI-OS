@@ -10,6 +10,14 @@
 #define BOOTINFO_VERSION_STRING "1"
 #define BOOTINFO_CMDLINE_MAX 256
 
+/* Virtual layout shared by loader and kernel. The loader maps:
+ *   [0xFFFF_8000_0000_0000, +64 GiB) -> physical 0 (direct map)
+ *   [0xFFFF_FFFF_8000_0000, +2 GiB)  -> physical 0 (kernel image window)
+ *   low identity map for the trampoline and early page tables.
+ */
+#define MCUBE_DIRECT_MAP_BASE 0xFFFF800000000000ULL
+#define MCUBE_KERNEL_VBASE    0xFFFFFFFF80000000ULL
+
 /* Simplified physical memory map entry types. */
 enum boot_mem_type {
     BOOT_MEM_USABLE = 1,   /* free RAM the allocator may use              */

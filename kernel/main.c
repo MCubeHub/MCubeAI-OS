@@ -1,10 +1,14 @@
-/* MCubeAIOS kernel entry (M1).
+/* MCubeAIOS kernel entry.
  *
  * At this point the loader has:
  *   - identity mapped low physical memory (64 GiB, 2 MiB pages)
+ *   - built the direct map at MCUBE_DIRECT_MAP_BASE (physical 0, 64 GiB)
+ *   - mapped the higher-half kernel window at MCUBE_KERNEL_VBASE
  *   - exited boot services
- *   - loaded the kernel ELF at 2 MiB
- * and RDI points at a validated Boot Info Block.
+ *   - loaded the kernel ELF at physical 2 MiB, executing in the top 2 GiB
+ * and RDI points at a validated Boot Info Block (physical address).
+ * Entry translates that pointer through the direct map immediately so the
+ * rest of the kernel never has to care.
  */
 
 #include <mcube/kernel.h>
@@ -43,13 +47,16 @@ static void banner(const boot_info_t *bi) {
     kprintf("  ------------------------------------------------------------\n");
     kprintf("  boot cpu %u   fb %ux%u   cmdline: %s\n",
             bi->boot_cpu, bi->fb_width, bi->fb_height, bi->cmdline);
-    kprintf("  kernel [%p, %p)  entry %p\n", (void *)bi->kernel_base,
-            (void *)(bi->kernel_base + bi->kernel_size), (void *)bi->kernel_entry);
-    kprintf("  rsdp %p   pml4 %p\n", (void *)bi->rsdp, (void *)bi->pml4_phys);
+    kprintf("  kernel [%p, %p)  entry %p\n",
+            (void *)(uptr)(MCUBE_KERNEL_VBASE + bi->kernel_base),
+            (void *)(uptr)(MCUBE_KERNEL_VBASE + bi->kernel_base + bi->kernel_size),
+            (void *)bi->kernel_entry);
+    kprintf("  rsdp %p   pml4 %p\n",
+            phys_to_virt(bi->rsdp), (void *)bi->pml4_phys);
 }
 
 static void dump_memory_map(const boot_info_t *bi) {
-    boot_mem_entry_t *map = (boot_mem_entry_t *)(uptr)bi->memmap_addr;
+    boot_mem_entry_t *map = (boot_mem_entry_t *)phys_to_virt(bi->memmap_addr);
     u64 usable = 0, reserved = 0, total = 0;
 
     for (u32 i = 0; i < bi->memmap_count; i++) {
@@ -83,16 +90,17 @@ static void check_rsdp(const boot_info_t *bi) {
         kprintf("[acpi] no RSDP handed over by loader\n");
         return;
     }
-    const char *sig = (const char *)(uptr)bi->rsdp;
+    const char *sig = (const char *)phys_to_virt(bi->rsdp);
     if (memcmp(sig, "RSD PTR ", 8) == 0) {
-        kprintf("[acpi] RSDP signature valid, revision %u\n", (u32)((const u8 *)(uptr)bi->rsdp)[15]);
+        kprintf("[acpi] RSDP signature valid, revision %u\n",
+                (u32)((const u8 *)phys_to_virt(bi->rsdp))[15]);
     } else {
-        kprintf("[acpi] bad RSDP signature at %p\n", (void *)bi->rsdp);
+        kprintf("[acpi] bad RSDP signature at %p\n", phys_to_virt(bi->rsdp));
     }
 }
 
 static u64 usable_bytes(const boot_info_t *bi) {
-    boot_mem_entry_t *map = (boot_mem_entry_t *)(uptr)bi->memmap_addr;
+    boot_mem_entry_t *map = (boot_mem_entry_t *)phys_to_virt(bi->memmap_addr);
     u64 usable = 0;
     for (u32 i = 0; i < bi->memmap_count; i++) {
         if (map[i].type == BOOT_MEM_USABLE) usable += map[i].length;
@@ -124,6 +132,10 @@ static void sched_monitor(void *arg) {
 }
 
 void kernel_main(boot_info_t *bi) {
+    /* The loader hands us a physical pointer. Move it into the direct map so
+     * every later dereference is a normal kernel-virtual access. */
+    bi = (boot_info_t *)phys_to_virt((u64)(uptr)bi);
+
     serial_init();
     console_init(bi);
 

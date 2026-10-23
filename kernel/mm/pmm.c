@@ -64,7 +64,7 @@ static int range_usable(const boot_mem_entry_t *e, u64 need) {
 }
 
 void pmm_init(const boot_info_t *bi) {
-    boot_mem_entry_t *map = (boot_mem_entry_t *)(uptr)bi->memmap_addr;
+    boot_mem_entry_t *map = (boot_mem_entry_t *)phys_to_virt(bi->memmap_addr);
     g_max_pfn = 0;
     for (u32 i = 0; i < bi->memmap_count; i++) {
         u64 end = map[i].base + map[i].length;
@@ -96,7 +96,7 @@ void pmm_init(const boot_info_t *bi) {
     }
     if (!bmp_phys) panic("pmm: cannot reserve %u KiB bitmap", (u32)(g_bitmap_bytes / KiB));
 
-    g_bitmap = (u8 *)(uptr)bmp_phys;
+    g_bitmap = (u8 *)phys_to_virt(bmp_phys);
     memset(g_bitmap, 0xFF, g_bitmap_bytes); /* everything used by default */
 
     g_free_pages = 0;
@@ -121,7 +121,7 @@ void pmm_init(const boot_info_t *bi) {
     use_range(bi->loader_stack_top - 64 * KiB, 64 * KiB);
     use_range(bi->pml4_phys, 66 * PAGE_SIZE);
     use_range(bi->memmap_addr, (u64)bi->memmap_count * bi->memmap_desc_size);
-    use_range((u64)(uptr)bi, PAGE_SIZE);
+    use_range(virt_to_phys(bi), PAGE_SIZE);
 
     g_hint = 1 * MiB / PAGE_SIZE;
     kprintf("[mm] pmm: %u MiB managed, %u MiB free, bitmap %u KiB @ %p\n",
@@ -144,7 +144,7 @@ u64 pmm_alloc_pages(u64 count) {
                 for (u64 i = 0; i < count; i++) bit_set(first + i);
                 g_free_pages -= count;
                 g_hint = first + count;
-                memset((void *)(uptr)(first * PAGE_SIZE), 0, count * PAGE_SIZE);
+                memset(phys_to_virt(first * PAGE_SIZE), 0, count * PAGE_SIZE);
                 return first * PAGE_SIZE;
             }
         } else {
@@ -162,7 +162,7 @@ u64 pmm_alloc_pages(u64 count) {
                 for (u64 i = 0; i < count; i++) bit_set(first + i);
                 g_free_pages -= count;
                 g_hint = first + count;
-                memset((void *)(uptr)(first * PAGE_SIZE), 0, count * PAGE_SIZE);
+                memset(phys_to_virt(first * PAGE_SIZE), 0, count * PAGE_SIZE);
                 return first * PAGE_SIZE;
             }
         } else {

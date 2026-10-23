@@ -32,7 +32,7 @@ KERNEL_CFLAGS   := -std=gnu11 -O2 -g -Wall -Wextra -Werror \
                    -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
                    -fno-omit-frame-pointer -mno-red-zone \
                    -mno-sse -mno-sse2 -mno-mmx \
-                   -mcmodel=small -Iinclude
+                   -mcmodel=kernel -Iinclude
 KERNEL_LDFLAGS  := -nostdlib -static -Wl,-T,kernel/linker.ld \
                    -Wl,--build-id=none -Wl,-z,max-page-size=4096
 LIBGCC          := $(shell $(CC) -print-libgcc-file-name)

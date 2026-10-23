@@ -4,6 +4,14 @@
 #include <mcube/types.h>
 #include <mcube/bootinfo.h>
 
+/* Physical <-> virtual helpers for the loader-created direct map. */
+static inline void *phys_to_virt(u64 phys) {
+    return (void *)(uptr)(MCUBE_DIRECT_MAP_BASE + phys);
+}
+static inline u64 virt_to_phys(const void *virt) {
+    return (u64)(uptr)virt - MCUBE_DIRECT_MAP_BASE;
+}
+
 /* ---- physical page allocator (pmm.c) ---- */
 void pmm_init(const boot_info_t *bi);
 u64  pmm_alloc_page(void);                 /* physical address, 0 on failure */

@@ -2,6 +2,7 @@
 
 #include <mcube/kernel.h>
 #include <mcube/io.h>
+#include <mcube/mm.h>
 
 #define FONT_W 8
 #define FONT_H 16
@@ -57,7 +58,7 @@ void fb_init(const boot_info_t *bi) {
     memset(&g_fb, 0, sizeof(g_fb));
     if (!bi || !bi->fb_base || bi->fb_width == 0 || bi->fb_height == 0) return;
 
-    g_fb.base = (u8 *)(uptr)bi->fb_base;
+    g_fb.base = (u8 *)phys_to_virt(bi->fb_base);
     g_fb.width = bi->fb_width;
     g_fb.height = bi->fb_height;
     g_fb.pitch = bi->fb_pitch ? bi->fb_pitch : bi->fb_width * 4;

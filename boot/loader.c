@@ -248,40 +248,61 @@ static EFI_STATUS load_elf(u8 *image, u64 image_size, boot_info_t *bi) {
 /* ------------------------------------------------------------------ */
 /* Paging                                                             */
 /* ------------------------------------------------------------------ */
-static EFI_STATUS build_identity_map(u64 *out_pml4) {
-    const u64 gib_count = IDENTITY_MAP_GIB;
-    const u64 pd_count = gib_count; /* one PD per 1 GiB, 2 MiB pages */
+#define L4(va) (((va) >> 39) & 0x1FF)
+#define L3(va) (((va) >> 30) & 0x1FF)
+#define L2(va) (((va) >> 21) & 0x1FF)
+#define PTE_ADDR_MASK 0x000FFFFFFFFFF000ULL
 
-    void *pml4_buf = NULL, *pdpt_buf = NULL;
-    EFI_PHYSICAL_ADDRESS pml4 = 0, pdpt = 0;
-    EFI_STATUS st;
-
-    st = BS->AllocatePages(AllocateAnyPages, EfiLoaderData, 1, &pml4);
+static EFI_STATUS alloc_zero_page(u64 *out) {
+    EFI_PHYSICAL_ADDRESS p = 0;
+    EFI_STATUS st = BS->AllocatePages(AllocateAnyPages, EfiLoaderData, 1, &p);
     if (EFI_ERROR(st)) return st;
-    st = BS->AllocatePages(AllocateAnyPages, EfiLoaderData, 1, &pdpt);
-    if (EFI_ERROR(st)) return st;
-    (void)pml4_buf; (void)pdpt_buf;
+    memset((void *)p, 0, PAGE_SIZE);
+    *out = p;
+    return EFI_SUCCESS;
+}
 
-    memset((void *)pml4, 0, PAGE_SIZE);
-    memset((void *)pdpt, 0, PAGE_SIZE);
+static u64 *get_table(u64 *parent, u64 index, EFI_STATUS *st) {
+    if (parent[index] & 1) return (u64 *)(uptr)(parent[index] & PTE_ADDR_MASK);
+    u64 phys = 0;
+    *st = alloc_zero_page(&phys);
+    if (EFI_ERROR(*st)) return NULL;
+    parent[index] = phys | 0x03;
+    return (u64 *)(uptr)phys;
+}
 
-    u64 *pml4e = (u64 *)pml4;
-    u64 *pdpte = (u64 *)pdpt;
-
-    for (u64 i = 0; i < pd_count; i++) {
-        EFI_PHYSICAL_ADDRESS pd = 0;
-        st = BS->AllocatePages(AllocateAnyPages, EfiLoaderData, 1, &pd);
-        if (EFI_ERROR(st)) return st;
-        memset((void *)pd, 0, PAGE_SIZE);
-        u64 *pde = (u64 *)pd;
-        for (u64 j = 0; j < 512; j++) {
-            pde[j] = (i * GiB + j * 2 * MiB) | 0x83; /* present|rw|huge */
-        }
-        pdpte[i] = pd | 0x03;
+/* Map [va, va+size) to [pa, pa+size) using 2 MiB pages. */
+static EFI_STATUS map_2mb(u64 *pml4, u64 va, u64 pa, u64 size) {
+    EFI_STATUS st = EFI_SUCCESS;
+    for (u64 off = 0; off < size; off += 2 * MiB) {
+        u64 v = va + off;
+        u64 *pdpt = get_table(pml4, L4(v), &st);
+        if (!pdpt) return st;
+        u64 *pd = get_table(pdpt, L3(v), &st);
+        if (!pd) return st;
+        if (pd[L2(v)] & 1) continue; /* already mapped by an earlier range */
+        pd[L2(v)] = (pa + off) | 0x83; /* P | RW | PS */
     }
+    return EFI_SUCCESS;
+}
 
-    pml4e[0] = pdpt | 0x03;
-    *out_pml4 = pml4;
+static EFI_STATUS build_page_tables(u64 *out_pml4) {
+    EFI_PHYSICAL_ADDRESS pml4_phys = 0;
+    EFI_STATUS st = alloc_zero_page(&pml4_phys);
+    if (EFI_ERROR(st)) return st;
+    u64 *pml4 = (u64 *)(uptr)pml4_phys;
+
+    /* Low identity map: trampoline stack and early debugging. */
+    st = map_2mb(pml4, 0, 0, IDENTITY_MAP_GIB * GiB);
+    if (EFI_ERROR(st)) return st;
+    /* Direct map: kernel can turn any physical address into a pointer. */
+    st = map_2mb(pml4, MCUBE_DIRECT_MAP_BASE, 0, IDENTITY_MAP_GIB * GiB);
+    if (EFI_ERROR(st)) return st;
+    /* Higher-half kernel window: physical 0..2 GiB. */
+    st = map_2mb(pml4, MCUBE_KERNEL_VBASE, 0, 2 * GiB);
+    if (EFI_ERROR(st)) return st;
+
+    *out_pml4 = pml4_phys;
     return EFI_SUCCESS;
 }
 
@@ -425,7 +446,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *systab) {
 
     /* Page tables. */
     u64 pml4_phys = 0;
-    st = build_identity_map(&pml4_phys);
+    st = build_page_tables(&pml4_phys);
     if (EFI_ERROR(st)) fail("cannot build page tables", st);
     bi->pml4_phys = pml4_phys;
     print("[MCUBOOT] pml4 ");
@@ -502,5 +523,6 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *systab) {
     bi->memmap_addr = (u64)(uptr)entries;
 
     /* No firmware services from here on. */
-    enter_kernel(bi->kernel_entry, bi->pml4_phys, bi->loader_stack_top, bi);
+    enter_kernel(bi->kernel_entry, bi->pml4_phys,
+                 MCUBE_KERNEL_VBASE + bi->loader_stack_top, bi);
 }

@@ -8,8 +8,10 @@ static volatile int g_panicking;
 
 static int in_kernel_text(u64 addr) {
     extern char __kernel_end[];
-    /* The kernel is identity mapped at 2 MiB for M1. */
-    return addr >= 0x200000ULL && addr < (u64)(uptr)__kernel_end;
+    /* The kernel executes from the top 2 GiB; the loader maps the image's
+     * physical pages there (KERNEL_VMA + 2 MiB .. __kernel_end). */
+    return addr >= MCUBE_KERNEL_VBASE + 0x200000ULL &&
+           addr < (u64)(uptr)__kernel_end;
 }
 
 void stack_trace(void) {

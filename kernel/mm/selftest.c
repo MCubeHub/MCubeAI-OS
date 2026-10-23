@@ -20,11 +20,11 @@ int mm_selftest(void) {
             failures++;
             break;
         }
-        memset((void *)(uptr)page_ptrs[i], (int)(0xA0 + (i & 0x1F)), PAGE_SIZE);
+        memset(phys_to_virt(page_ptrs[i]), (int)(0xA0 + (i & 0x1F)), PAGE_SIZE);
     }
     for (u32 i = 0; i < PAGE_TEST_COUNT; i++) {
         if (!page_ptrs[i]) continue;
-        u8 *p = (u8 *)(uptr)page_ptrs[i];
+        u8 *p = (u8 *)phys_to_virt(page_ptrs[i]);
         u8 expect = (u8)(0xA0 + (i & 0x1F));
         if (p[0] != expect || p[PAGE_SIZE - 1] != expect || p[1234] != expect) {
             kprintf("[test] pmm: pattern mismatch on page %u\n", i);
