@@ -1,14 +1,16 @@
-# 用户空间（M7/M8）
+# 用户空间（M7–M9）
 
 ```
 user/
 ├── lib/         freestanding C 库：crt0、syscall 包装、string、stdio、stdlib
 │   ├── gui.c    桌面协议客户端（fd 3 命令 / fd 4 事件）
+│   ├── ai.c     AI 会话客户端（完整消息收发）
 │   └── font.c   8×16 位图字体（复用 kernel/font/font8x16.c）
-├── programs/    sh、coreutils 与桌面应用
+├── programs/    sh、coreutils、桌面应用与 AI
 │   ├── desktop.c    合成器、窗口管理、任务栏、开始菜单
-│   └── terminal.c files.c editor.c calc.c image.c settings.c taskman.c
-├── init.c       PID 1：自检 + fork/exec/pipe/重定向测试 + 启动桌面/shell
+│   ├── terminal.c files.c editor.c calc.c image.c settings.c taskman.c
+│   └── aiosd.c AI 守护进程；ai.c 命令行客户端
+├── init.c       PID 1：自检 + fork/exec/pipe/重定向 + AI 端到端 + 桌面/shell
 └── user.ld      用户程序链接脚本（固定 0x400000，_start 入口）
 ```
 

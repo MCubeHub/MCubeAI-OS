@@ -162,17 +162,35 @@
   7 个应用；`make gui-test` 通过 QEMU monitor 发送 F1/方向键/回车与
   PS/2 鼠标点击，验证菜单导航、应用启动与焦点切换。
 
-## M9 — AI 原生层
+## M9 — AI 原生层（基线完成）
 
 对应清单：五、六.1–六.2。
 
-- `aiosd`：GGUF(Q4/Q5/Q8) 加载、CPU 推理（SIMD）、BPE、采样、流式输出。
-- 上下文管理器（截断/摘要/KV cache 快照恢复）。
-- 记忆管理器（LRU-K 短记忆）+ 存储管理器（会话归档、本地向量检索）。
-- Agent 调度器、工具管理器（文件/进程/网络/计算/沙箱执行）、Access Manager。
-- `ai_*` 系统调用号段、事件通知、`ai` CLI、Shell `?` 集成、桌面 AI 客户端。
-- 验收：离线完成单轮与多轮对话；`ai exec "查看内存占用最高的进程"` 正确调用工具；
-  未授权目录访问被拒绝且写入审计日志；重启后恢复最近会话。
+- 已实现（基线）：
+  - 内核侧：`SYS_AI_CONNECT/ACCEPT/STATUS/AUDIT/LOG`（`0x400` 段），
+    每个会话由两条匿名管道组成（客户端 fd 3/4，守护进程对端），
+    守护进程注册与单实例检查，64 项内核审计环（仅守护进程可写）。
+  - 传输：528 字节定长 `ai_msg_t`（type/session/flags/len/data），
+    大消息分片；用户态 `ai_send/ai_recv` 按整条消息收发，避免内核
+    512 字节管道读上限造成截断。
+  - 推理：GGUF v3 解析（llama 元数据、F32 张量）、字节级 256 词表、
+    llama 风格单层前向（RMSNorm/注意力/FFN，可选）、top-k + 温度采样、
+    SSE2 数学内核；内置 `build/tiny.gguf` 由 `tools/gen_tiny_model.py`
+    生成，以 8.3 名 `/models/tiny.ggu` 放入 ESP。
+  - 服务：`aiosd` 常驻，提供 HELLO/CHAT/STATUS/TOOL_LIST/MEMORY/
+    AUDIT/MODEL/CANCEL，逐 token 流式事件；`ai` CLI 支持单轮、多轮、
+    `exec` 与状态/工具/模型/审计/记忆子命令。
+  - Agent：规则意图路由 + 9 个工具（`sys.info/sys.time/sys.disk/
+    proc.list/fs.list/fs.read/fs.write/fs.search/calc.eval`），
+    `fs.write` 需客户端确认，工具与拒绝均写审计；每会话保留最近若干轮。
+- 待实现：Q4/Q5/Q8 反量化与量化矩阵乘、BPE/SentencePiece、KV cache
+  快照与上下文摘要/恢复、LRU-K 与向量检索、会话落盘、工具调用次数
+  上限、沙箱进程、Shell `?` 集成、桌面 AI 客户端、故障诊断。
+- 验收：`make test` 断言 `AI_DAEMON_OK`（守护进程就绪）、
+  `AI_MODEL_OK`（内置 GGUF 加载）、`AI_TOOL_OK`（`ai exec "system
+  info"` 路由并执行 `sys.info`）、`AI_CHAT_OK`（模型流式回答）；
+  `ai status/tools/audit` 可在交互式 Shell 中手工验证。离线运行，
+  不依赖网络。
 
 ## M10 — 安全加固、可观测性与发布
 

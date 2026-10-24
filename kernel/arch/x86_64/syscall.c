@@ -15,8 +15,12 @@
 #include <mcube/vfs.h>
 #include <mcube/tty.h>
 #include <mcube/net.h>
-#include <mcube/pipe.h>
 #include <mcube/mm.h>
+#include <mcube/pipe.h>
+#include <mcube/user.h>
+#include <mcube/ai.h>
+
+struct pipe_end;
 
 /* Selectors: kernel code 0x08, kernel data 0x10, user data 0x18, user code
  * 0x20. STAR encodes both the syscall and sysret pairs. */
@@ -111,7 +115,7 @@ static int fd_alloc_socket(struct net_socket *s) {
     task_t *t = current_task();
     if (!t) return -ESRCH;
     for (int i = 3; i < VFS_MAX_FDS; i++) {
-        if (!t->files[i] && !t->socks[i]) {
+        if (!t->files[i] && !t->socks[i] && !t->pipes[i]) {
             t->socks[i] = s;
             return i;
         }
@@ -937,6 +941,102 @@ static long sys_kill(u32 pid, int sig) {
     return task_kill(pid, 128 + sig);
 }
 
+/* ---- M9: AI-native channel ----------------------------------------- */
+
+/* Install a request/response pipe pair as fd 3/4 equivalents (the first two
+ * free descriptors) and copy them back to the caller. */
+static int ai_install_pair(struct pipe_end *a, struct pipe_end *b, u64 ufds) {
+    task_t *t = current_task();
+    if (!t) return -ESRCH;
+
+    int fds[2] = { -1, -1 };
+    for (int i = 3; i < VFS_MAX_FDS && fds[1] < 0; i++) {
+        if (!fd_slot_free(t, i)) continue;
+        if (fds[0] < 0) fds[0] = i;
+        else fds[1] = i;
+    }
+    if (fds[1] < 0) return -ENFILE;
+
+    t->pipes[fds[0]] = a;
+    t->pipes[fds[1]] = b;
+
+    if (copy_to_user((void *)(uptr)ufds, fds, sizeof(fds)) != 0) {
+        fd_close_slot(t, fds[0]);
+        fd_close_slot(t, fds[1]);
+        return -EFAULT;
+    }
+    return 0;
+}
+
+static long sys_ai_connect(u64 ufds) {
+    if (!ufds) return -EINVAL;
+
+    struct pipe_end *req_w = NULL;
+    struct pipe_end *resp_r = NULL;
+    u32 session = 0;
+    int rc = ai_chan_connect(&req_w, &resp_r, &session);
+    if (rc != 0) return rc;
+
+    rc = ai_install_pair(req_w, resp_r, ufds);
+    if (rc != 0) {
+        pipe_end_close(req_w);
+        pipe_end_close(resp_r);
+        ai_chan_cancel(session);
+        return rc;
+    }
+    return (long)session;
+}
+
+static long sys_ai_accept(u64 ufds) {
+    if (!ufds) return -EINVAL;
+
+    struct pipe_end *req_r = NULL;
+    struct pipe_end *resp_w = NULL;
+    u32 client_pid = 0;
+    int rc = ai_chan_accept(&req_r, &resp_w, &client_pid);
+    if (rc != 0) return rc;
+
+    rc = ai_install_pair(req_r, resp_w, ufds);
+    if (rc != 0) {
+        pipe_end_close(req_r);
+        pipe_end_close(resp_w);
+        return rc;
+    }
+    return (long)client_pid;
+}
+
+static long sys_ai_status(u64 ust) {
+    if (!ust) return -EINVAL;
+    mcube_ai_status_t st;
+    ai_chan_status(&st);
+    if (copy_to_user((void *)(uptr)ust, &st, sizeof(st)) != 0) return -EFAULT;
+    return 0;
+}
+
+static long sys_ai_audit(u64 uout, u32 max) {
+    if (!uout || max == 0) return -EINVAL;
+    if (max > AI_AUDIT_RING) max = AI_AUDIT_RING;
+
+    mcube_ai_audit_t *tmp = kmalloc((usize)(max * sizeof(*tmp)));
+    if (!tmp) return -ENOMEM;
+    u32 n = ai_audit_read(tmp, max);
+    int rc = 0;
+    if (n && copy_to_user((void *)(uptr)uout, tmp,
+                          (u64)n * sizeof(*tmp)) != 0) {
+        rc = -EFAULT;
+    }
+    kfree(tmp);
+    return rc != 0 ? rc : (long)n;
+}
+
+static long sys_ai_log(u32 kind, u64 utext) {
+    if (!utext) return -EINVAL;
+    char text[64];
+    int rc = copy_user_str(text, sizeof(text), utext);
+    if (rc != 0) return rc;
+    return ai_chan_audit(kind, text);
+}
+
 void syscall_handler(syscall_frame_t *f) {
     task_t *t = current_task();
     if (t) t->syscalls++;
@@ -1075,13 +1175,24 @@ void syscall_handler(syscall_frame_t *f) {
     case SYS_TASKINFO:
         ret = sys_taskinfo(f->rdi, f->rsi);
         break;
+    case SYS_AI_CONNECT:
+        ret = sys_ai_connect(f->rdi);
+        break;
+    case SYS_AI_ACCEPT:
+        ret = sys_ai_accept(f->rdi);
+        break;
+    case SYS_AI_STATUS:
+        ret = sys_ai_status(f->rdi);
+        break;
+    case SYS_AI_AUDIT:
+        ret = sys_ai_audit(f->rdi, (u32)f->rsi);
+        break;
+    case SYS_AI_LOG:
+        ret = sys_ai_log((u32)f->rdi, f->rsi);
+        break;
     default:
-        if (f->nr >= SYS_AI_BASE && f->nr <= SYS_AI_LAST) {
-            /* aiosd endpoints are wired up with the AI layer (M9). */
-            ret = -ENOSYS;
-        } else {
-            ret = -ENOSYS;
-        }
+        /* Reserved AI endpoints (0x400..0x417) included. */
+        ret = -ENOSYS;
         break;
     }
     f->nr = (u64)ret;

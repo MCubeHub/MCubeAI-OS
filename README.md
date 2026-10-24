@@ -4,10 +4,12 @@
 而不是桌面上外挂的一个应用。项目按「启动 → 内核 → 系统服务 → 应用层 → AI 原生层」
 分层推进，每个里程碑都有可运行、可验证的交付物。
 
-当前状态：**M8 完成（图形子系统与桌面）**。M0–M7 已交付 UEFI 引导、
+当前状态：**M9 基线完成（AI 原生层）**。M0–M8 已交付 UEFI 引导、
 higher-half 内核、内存/调度/系统调用、块设备/FAT32/VFS/TTY、e1000 网络栈、
-用户态 libc/Shell/coreutils；M8 增加帧缓冲映射、PS/2 鼠标、GUI 协议、
-集中式合成器与 7 个桌面应用。`make test` 覆盖全部里程碑标记。
+用户态 libc/Shell/coreutils、帧缓冲/合成器与 7 个桌面应用；M9 增加常驻
+AI 守护进程 `aiosd`、GGUF v3 加载与本地推理、流式输出、规则意图路由、
+9 个内置工具、确认与审计、`ai` CLI，并由 PID 1 做端到端自检。
+`make test` 覆盖全部里程碑标记。
 
 ```
                  ┌─────────────────────────────────────────────┐
@@ -65,8 +67,15 @@ wsl -d Debian -- bash -c "cd /mnt/z/MCubeAIOS && make test"
   应用使用离屏 surface + 管道协议），窗口平铺/焦点/关闭、任务栏、
   开始菜单、时钟、鼠标光标，以及 Terminal/Files/Editor/Calculator/
   Image Viewer/Settings/Task Manager 七个应用。
-- **AI 原生层预留**：`0x400–0x417` 系统调用号段与内核钩子已注册，
-  `aiosd` 用户态推理守护进程在 M9 实现。
+- **M9 AI 原生层（基线）**：内核提供两条匿名管道组成的会话通道与
+  `0x400–0x417` 系统调用号段；用户态 `aiosd` 加载 GGUF v3 模型
+  （内置 256 字节词表的 tiny bigram，F32 张量），执行 llama 风格
+  前向、RMSNorm 与 top-k/温度采样，逐 token 流式返回。规则路由把
+  自然语言映射到 9 个工具（系统信息/时间/磁盘/进程/目录/读文件/
+  写文件/搜索/计算），写文件需客户端确认，所有工具调用写入内核审计环。
+  `ai` CLI 支持单轮、多轮、`exec`、`status/tools/model/audit/memory`。
+- **后续里程碑**：Q4/Q5/Q8 量化模型、BPE 词表、上下文摘要与恢复、
+  LRU-K/向量记忆、会话归档、桌面 AI 客户端、Shell `?` 集成与沙箱。
 
 ## 目录
 
@@ -77,9 +86,9 @@ wsl -d Debian -- bash -c "cd /mnt/z/MCubeAIOS && make test"
 | `kernel/arch/x86_64/` | 入口、GDT/TSS、IDT/ISR、CPU 原语 |
 | `kernel/drivers/` | 串口、帧缓冲控制台（后续 AHCI/键盘/网卡…） |
 | `kernel/lib/` | 字符串、printf、panic |
-| `kernel/ai/` | AI 子系统内核侧钩子（用户态推理守护进程在 M9） |
-| `user/` | libc、shell、coreutils、GUI（M7/M8） |
-| `ai/` | `aiosd` 与 AI 运行时（M9） |
+| `kernel/ai/` | AI 会话通道、审计环与守护进程注册（内核侧） |
+| `user/` | libc、shell、coreutils、GUI 与 `ai` 客户端（M7–M9） |
+| `ai/` | `aiosd` 使用的 GGUF/推理运行时、工具与会话记忆（M9） |
 | `docs/` | 架构、路线图、验收矩阵、AI 设计 |
 | `tools/` | 字体生成、QEMU 运行、环境检查 |
 

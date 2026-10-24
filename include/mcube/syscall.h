@@ -125,6 +125,12 @@ typedef struct PACKED mcube_task_info {
 
 #define MCUBE_SIGTERM 15
 
+#define SYS_AI_CONNECT 0x400
+#define SYS_AI_ACCEPT  0x401
+#define SYS_AI_STATUS  0x405
+#define SYS_AI_AUDIT   0x408
+#define SYS_AI_LOG     0x409
+
 /* AI-native range, owned by aiosd; see docs/ai-native.md. */
 #define SYS_AI_BASE 0x400
 #define SYS_AI_LAST 0x417

@@ -9,6 +9,7 @@
 #include <mcube/types.h>
 #include <mcube/syscall.h>
 #include <mcube/vfs.h>
+#include <mcube/ai.h>
 
 typedef long ssize_t;
 typedef long off_t;

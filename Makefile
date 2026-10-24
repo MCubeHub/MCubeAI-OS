@@ -56,7 +56,10 @@ KERNEL_OBJS     := $(patsubst %.c,$(BUILD)/%.o,$(KERNEL_C_SRCS)) \
 # coreutils are read from /BIN on the FAT32 ESP and launched by the shell.
 USER_CFLAGS     := -std=gnu11 -O2 -Wall -Wextra -Werror -ffreestanding \
                    -fno-stack-protector -fno-pic -fno-pie -mno-red-zone \
-                   -mno-sse -mno-sse2 -mno-mmx -fno-builtin -nostdlib -Iinclude
+                   -mno-sse -mno-sse2 -mno-mmx -fno-builtin -nostdlib -Iinclude -Iai
+# The AI runtime does float math; the scheduler FXSAVE/FXRSTORes per task, so
+# SSE2 is safe here. The rest of user space stays on x87 for compatibility.
+AI_CFLAGS       := $(USER_CFLAGS) -msse -msse2
 USER_LDFLAGS    := -nostdlib -static -Wl,-T,user/user.ld \
                    -Wl,--build-id=none -Wl,-z,max-page-size=4096 -Wl,-e,_start
 USER_OBJ        := $(BUILD)/user/init.o
@@ -67,9 +70,13 @@ USER_LIB_S_SRCS := $(shell find user/lib -name '*.asm' | sort)
 USER_LIB_OBJS   := $(patsubst %.c,$(BUILD)/%.o,$(USER_LIB_C_SRCS)) \
                    $(patsubst %.asm,$(BUILD)/%.o,$(USER_LIB_S_SRCS))
 
+AI_TOOLS_C := $(shell find ai -name '*.c' 2>/dev/null | sort)
+AI_TOOLS_O := $(patsubst %.c,$(BUILD)/%.o,$(AI_TOOLS_C))
+
 USER_PROGS      := sh ls cat echo mkdir rm cp mv pwd sleep wc grep head tail \
                    uname true false clear env help \
-                   desktop terminal files editor calc image settings taskman
+                   desktop terminal files editor calc image settings taskman \
+                   aiosd ai
 USER_PROG_OBJS  := $(addprefix $(BUILD)/user/bin/,$(addsuffix .o,$(USER_PROGS)))
 USER_PROG_ELFS  := $(addprefix $(BUILD)/user/bin/,$(addsuffix .elf,$(USER_PROGS)))
 
@@ -129,6 +136,17 @@ $(BUILD)/user/bin/%.o: user/programs/%.c include/mcube/libc.h
 	$(CC) $(USER_CFLAGS) -MMD -MP -c -o $@ $<
 	@echo "  UCC     $<"
 
+# The AI runtime is freestanding user-space code linked into aiosd only.
+$(BUILD)/ai/%.o: ai/%.c ai/ai_runtime.h include/mcube/libc.h include/mcube/ai.h
+	@mkdir -p $(dir $@)
+	$(CC) $(AI_CFLAGS) -MMD -MP -c -o $@ $<
+	@echo "  UCC     $<"
+
+$(BUILD)/tiny.gguf: tools/gen_tiny_model.py
+	@mkdir -p $(dir $@)
+	python3 tools/gen_tiny_model.py $@
+	@echo "  MODEL   $@"
+
 $(USER_ELF): $(USER_OBJ) $(USER_LIB_OBJS) user/user.ld
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_LDFLAGS) -o $@ $(USER_OBJ) $(USER_LIB_OBJS) $(LIBGCC)
@@ -137,6 +155,13 @@ $(USER_ELF): $(USER_OBJ) $(USER_LIB_OBJS) user/user.ld
 $(BUILD)/user/bin/%.elf: $(BUILD)/user/bin/%.o $(USER_LIB_OBJS) user/user.ld
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_LDFLAGS) -o $@ $< $(USER_LIB_OBJS) $(LIBGCC)
+	@echo "  ULD     $@"
+
+$(BUILD)/user/bin/aiosd.elf: $(BUILD)/user/bin/aiosd.o $(AI_TOOLS_O) \
+                             $(USER_LIB_OBJS) user/user.ld
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_LDFLAGS) -o $@ $(BUILD)/user/bin/aiosd.o $(AI_TOOLS_O) \
+	      $(USER_LIB_OBJS) $(LIBGCC)
 	@echo "  ULD     $@"
 
 $(USER_BLOB_C): $(USER_ELF) tools/gen_blob.py
@@ -154,14 +179,17 @@ $(BOOT_EFI): boot/loader.c boot/efi.h include/mcube/bootinfo.h include/mcube/typ
 	$(MINGW) $(BOOT_CFLAGS) $(BOOT_LDFLAGS) -o $@ boot/loader.c
 	@echo "  EFI     $@"
 
-$(ESP_IMG): $(KERNEL_ELF) $(BOOT_EFI) $(USER_PROG_ELFS)
+$(ESP_IMG): $(KERNEL_ELF) $(BOOT_EFI) $(USER_PROG_ELFS) $(BUILD)/tiny.gguf
 	@mkdir -p $(dir $@)
 	rm -f $@
 	dd if=/dev/zero of=$@ bs=1M count=64 status=none
 	mformat -i $@ -F ::
-	mmd -i $@ ::/EFI ::/EFI/BOOT ::/BIN
+	mmd -i $@ ::/EFI ::/EFI/BOOT ::/BIN ::/MODELS
 	mcopy -i $@ $(BOOT_EFI) ::/EFI/BOOT/BOOTX64.EFI
 	mcopy -i $@ $(KERNEL_ELF) ::/kernel.elf
+	# The FAT32 driver does not parse LFN entries yet, so the model must use
+	# an 8.3 short name on the ESP.
+	mcopy -i $@ $(BUILD)/tiny.gguf ::/MODELS/TINY.GGU
 	@for p in $(USER_PROGS); do \
 	  mcopy -i $@ $(BUILD)/user/bin/$$p.elf ::/BIN/`echo $$p | tr 'a-z' 'A-Z'`.ELF || exit 1; \
 	done
@@ -211,3 +239,4 @@ check-env:
 
 -include $(KERNEL_OBJS:.o=.d)
 -include $(USER_OBJ:.o=.d) $(USER_LIB_OBJS:.o=.d) $(USER_PROG_OBJS:.o=.d)
+-include $(AI_TOOLS_O:.o=.d)

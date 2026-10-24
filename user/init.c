@@ -65,6 +65,88 @@ static int run_redirect_test(void) {
     return strcmp(buf, "m7-redirect\n") == 0 ? 0 : -1;
 }
 
+/* ---- M9: AI daemon + client end-to-end ------------------------------ */
+
+/* Capture a child's stdout without a pipe: a dead child stays a zombie until
+ * waitpid(), and its pipe write end is only released on fd cleanup, so reading
+ * to EOF before reaping would deadlock. tmpfs removes the ordering issue. */
+static int capture(const char *path, char *const argv[], char *out, int cap) {
+    const char *tmp = "/tmp/ai-cap.txt";
+    out[0] = 0;
+    if (cap < 2) return -1;
+
+    int fd = open(tmp, VFS_O_WRONLY | VFS_O_CREAT | VFS_O_TRUNC);
+    if (fd < 3) return -1;
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(fd);
+        return -1;
+    }
+    if (pid == 0) {
+        dup2(fd, 1);
+        close(fd);
+        execv(path, argv);
+        _exit(127);
+    }
+    close(fd);
+
+    int status = -1;
+    if (waitpid(pid, &status, 0) != pid || status != 0) return -1;
+
+    fd = open(tmp, VFS_O_RDONLY);
+    if (fd < 3) return -1;
+    int n = 0;
+    while (n < cap - 1) {
+        long r = read(fd, out + n, (size_t)(cap - 1 - n));
+        if (r <= 0) break;
+        n += (int)r;
+    }
+    close(fd);
+    out[n] = 0;
+    unlink(tmp);
+    return n;
+}
+
+static int wait_ai_ready(void) {
+    for (int i = 0; i < 500; i++) {
+        mcube_ai_status_t st;
+        if (ai_status(&st) == 0 && st.daemon_pid != 0) return 0;
+        sleep_ms(10);
+    }
+    return -1;
+}
+
+static void run_ai_tests(void) {
+    pid_t pid = fork();
+    if (pid < 0) {
+        printf("AI_DAEMON_FAIL: fork\n");
+        return;
+    }
+    if (pid == 0) {
+        static char *argv[] = { "aiosd", NULL };
+        execv("/bin/aiosd.elf", argv);
+        printf("AI_DAEMON_EXEC_FAIL\n");
+        _exit(127);
+    }
+
+    if (wait_ai_ready() != 0) {
+        printf("AI_DAEMON_FAIL: timeout\n");
+        return;
+    }
+
+    char buf[4096];
+    static char *tool_argv[] = { "ai", "exec", "system info", NULL };
+    int n = capture("/bin/ai.elf", tool_argv, buf, sizeof(buf));
+    if (n > 0 && strstr(buf, "-> sys.info")) printf("AI_TOOL_OK\n");
+    else printf("AI_TOOL_FAIL\n");
+
+    static char *chat_argv[] = { "ai", "exec", "hello", NULL };
+    n = capture("/bin/ai.elf", chat_argv, buf, sizeof(buf));
+    if (n > 16) printf("AI_CHAT_OK\n");
+    else printf("AI_CHAT_FAIL\n");
+}
+
 int main(int argc, char **argv, char **envp) {
     (void)argc; (void)argv; (void)envp;
 
@@ -157,6 +239,8 @@ int main(int argc, char **argv, char **envp) {
 
     if (run_shell_test() == 0) printf("USER_SHELL_OK\n");
     if (run_redirect_test() == 0) printf("USER_REDIR_OK\n");
+
+    run_ai_tests();
 
     sleep_ms(40);
     printf("USER_INIT_OK\n");

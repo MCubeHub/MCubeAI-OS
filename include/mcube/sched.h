@@ -42,6 +42,7 @@ typedef struct task {
     struct vfs_file *files[VFS_MAX_FDS];
     struct net_socket *socks[VFS_MAX_FDS];
     struct pipe_end *pipes[VFS_MAX_FDS];
+    u8 fpu_state[512] __attribute__((aligned(16)));
     char cwd[VFS_PATH_MAX];
     char name[24];
     struct task *next;
@@ -67,6 +68,7 @@ void task_sleep_ms(u64 ms);
 void task_yield(void);
 task_t *current_task(void);
 u32  task_count(void);
+int  task_exists(u32 pid);
 
 NORETURN void thread_exit(void);
 void sched_dump(void);

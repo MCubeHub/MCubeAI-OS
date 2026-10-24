@@ -60,6 +60,7 @@ markers=(
     USER_INIT_OK USER_EFAULT_OK USER_EINVAL_OK
     USER_VFS_OK USER_DIR_OK USER_STAT_OK USER_TTY_OK USER_NET_OK
     USER_SHELL_OK USER_REDIR_OK
+    AI_DAEMON_OK AI_MODEL_OK AI_TOOL_OK AI_CHAT_OK
     USER_DESKTOP_OK USER_GUI_OK
 )
 
@@ -73,4 +74,4 @@ if [ ${#missing[@]} -ne 0 ]; then
     exit 1
 fi
 
-echo "TEST PASS: boot + scheduler + VFS + net + user/syscall + GUI markers found"
+echo "TEST PASS: boot + scheduler + VFS + net + user/syscall + AI + GUI markers found"

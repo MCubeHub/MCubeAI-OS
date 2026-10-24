@@ -16,6 +16,7 @@
 #include <mcube/net.h>
 #include <mcube/pipe.h>
 #include <mcube/syscall.h>
+#include <mcube/ai.h>
 
 #define KERNEL_STACK_SIZE (16 * 1024)
 #define IDLE_PID 0
@@ -24,6 +25,9 @@ extern void context_switch(u64 *old_rsp, u64 new_rsp);
 extern void thread_entry_trampoline(void);
 extern void user_entry_trampoline(void);
 extern void syscall_return_tail(void);
+extern void fpu_init(void);
+extern void fpu_save(void *area);
+extern void fpu_restore(const void *area);
 
 static task_t *g_current;
 static task_t *g_idle;
@@ -89,6 +93,8 @@ task_t *task_create(const char *name, void (*entry)(void *), void *arg) {
     t->wake_tick = 0;
     t->total_ticks = 0;
     t->switches = 0;
+    fpu_init();
+    fpu_save(t->fpu_state);
     strncpy(t->name, name ? name : "task", sizeof(t->name) - 1);
 
     u64 top = ALIGN_DOWN((u64)(uptr)stack + KERNEL_STACK_SIZE, 16);
@@ -127,6 +133,8 @@ task_t *task_create_user(const char *name, u64 entry, u64 stack_top, u64 pml4_ph
     t->pml4_phys = pml4_phys;
     t->user_entry = entry;
     t->user_stack_top = stack_top;
+    fpu_init();
+    fpu_save(t->fpu_state);
     t->cwd[0] = '/';
     t->cwd[1] = 0;
     strncpy(t->name, name ? name : "user", sizeof(t->name) - 1);
@@ -174,6 +182,8 @@ task_t *task_create_user_fork(const char *name, const struct syscall_frame *f,
     t->pml4_phys = pml4_phys;
     t->user_entry = f->user_rip;
     t->user_stack_top = f->user_rsp;
+    fpu_init();
+    fpu_save(t->fpu_state);
     t->cwd[0] = '/';
     t->cwd[1] = 0;
     strncpy(t->name, name ? name : "user", sizeof(t->name) - 1);
@@ -214,6 +224,7 @@ void sched_init(void) {
     g_active = 0;
     g_need_resched = 0;
     g_task_count = 0;
+    fpu_init();
 
     g_idle = task_create("idle", idle_main, NULL);
     if (!g_idle) panic("sched: cannot create idle task");
@@ -251,6 +262,7 @@ static void reap_dead(void) {
             vfs_task_cleanup(t);
             net_task_cleanup(t);
             pipe_task_cleanup(t);
+            ai_chan_task_cleanup(t);
             u64 stack = t->kstack_base;
             u64 pml4 = t->pml4_phys;
             kfree(t);
@@ -294,6 +306,11 @@ void schedule(void) {
      * stack and this function stay valid across the CR3 write. */
     u64 want = next->pml4_phys ? next->pml4_phys : vmm_kernel_pml4_phys();
     if (read_cr3() != want) write_cr3(want);
+
+    if (next != prev) {
+        fpu_save(prev->fpu_state);
+        fpu_restore(next->fpu_state);
+    }
 
     context_switch(&prev->rsp, next->rsp);
     irq_restore(flags);
@@ -374,6 +391,15 @@ NORETURN void thread_exit(void) {
 
 task_t *current_task(void) { return g_current; }
 u32 task_count(void) { return g_task_count; }
+int task_exists(u32 pid) {
+    if (!g_tasks) return 0;
+    task_t *t = g_tasks;
+    do {
+        if (t->pid == pid && t->state != TASK_DEAD) return 1;
+        t = t->next;
+    } while (t != g_tasks);
+    return 0;
+}
 
 void task_set_exit_status(int status) {
     if (g_current) g_current->exit_status = (u32)status;

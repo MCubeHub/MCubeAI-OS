@@ -7,6 +7,9 @@ global gdt_flush
 global tss_flush
 global idt_load
 global read_rflags
+global fpu_init
+global fpu_save
+global fpu_restore
 
 ; void gdt_flush(const struct gdt_ptr *ptr)
 gdt_flush:
@@ -39,4 +42,30 @@ idt_load:
 read_rflags:
     pushfq
     pop     rax
+    ret
+
+; Enable SSE/x87 and give every task a clean FPU state. The scheduler uses
+; FXSAVE/FXRSTOR so user-space inference cannot corrupt other processes.
+; void fpu_init(void)
+fpu_init:
+    mov     rax, cr0
+    and     rax, ~4          ; CR0.EM = 0
+    or      rax, 2           ; CR0.MP = 1
+    and     rax, ~8          ; CR0.TS = 0
+    mov     cr0, rax
+
+    mov     rax, cr4
+    or      rax, (1 << 9) | (1 << 10) ; OSFXSR | OSXMMEXCPT
+    mov     cr4, rax
+    fninit
+    ret
+
+; void fpu_save(void *area) -- area must be 16-byte aligned, 512 bytes.
+fpu_save:
+    fxsave  [rdi]
+    ret
+
+; void fpu_restore(const void *area)
+fpu_restore:
+    fxrstor [rdi]
     ret
