@@ -1,4 +1,4 @@
-/* User address spaces, ELF loading and copy_*_user.
+/* User address spaces, LGY/ELF loading and copy_*_user.
  *
  * Every process gets a private low half. The high half (direct map, vmalloc,
  * kernel image) is shared by copying the kernel PML4 entries, so syscalls and
@@ -12,6 +12,7 @@
 #include <mcube/syscall.h>
 #include <mcube/percpu.h>
 #include <mcube/io.h>
+#include <mcube/lgy.h>
 
 #define PTE_ADDR_MASK 0x000FFFFFFFFFF000ULL
 #define PML4_INDEX(va) (((va) >> 39) & 0x1FF)
@@ -52,8 +53,8 @@ typedef struct {
     u64 align;
 } Elf64_Phdr;
 
-extern const u8 user_init_elf[];
-extern const u64 user_init_elf_size;
+extern const u8 user_init_lgy[];
+extern const u64 user_init_lgy_size;
 
 static inline u64 *table_ptr(u64 phys) {
     return (u64 *)phys_to_virt(phys);
@@ -125,6 +126,92 @@ void user_as_destroy(u64 pml4_phys) {
     pmm_free_page(pml4_phys);
 }
 
+static int map_user_segment(u64 pml4_phys, const u8 *image,
+                            u64 vaddr, u64 filesz, u64 memsz,
+                            u64 offset, u32 seg_flags) {
+    if (memsz == 0) return 0;
+    if (vaddr < USER_BASE) return -EINVAL;
+    if (vaddr + memsz < vaddr) return -EINVAL;
+    if (vaddr + memsz > USER_SPACE_END) return -EINVAL;
+
+    u64 start = ALIGN_DOWN(vaddr, PAGE_SIZE);
+    u64 end = ALIGN_UP(vaddr + memsz, PAGE_SIZE);
+
+    for (u64 va = start; va < end; va += PAGE_SIZE) {
+        u64 pa = pmm_alloc_page();
+        if (!pa) return -ENOMEM;
+
+        u8 *dst = (u8 *)phys_to_virt(pa);
+        u64 copy_start = MAX(va, vaddr);
+        u64 copy_end = MIN(va + PAGE_SIZE, vaddr + filesz);
+        if (copy_end > copy_start) {
+            memcpy(dst + (copy_start - va),
+                   image + offset + (copy_start - vaddr),
+                   copy_end - copy_start);
+        }
+
+        u64 flags = 0;
+        if (seg_flags & LGY_SEG_W) flags |= PTE_WRITE;
+        if (!(seg_flags & LGY_SEG_X)) flags |= PTE_NX;
+
+        if (user_map(pml4_phys, va, pa, flags) != 0) {
+            pmm_free_page(pa);
+            return -ENOMEM;
+        }
+    }
+    return 0;
+}
+
+int user_load_lgy(u64 pml4_phys, const u8 *image, u64 size, u64 *entry_out) {
+    if (!lgy_has_magic(image, size)) return -EINVAL;
+    if (size < sizeof(lgy_header_t)) return -EINVAL;
+
+    const lgy_header_t *h = (const lgy_header_t *)image;
+    if (h->version != LGY_VERSION) return -EINVAL;
+    if (h->arch != LGY_ARCH_X86_64) return -EINVAL;
+    if (h->kind != LGY_KIND_NATIVE) return -EINVAL;
+    if (h->flags != 0 || h->reserved != 0) return -EINVAL;
+    if (h->seg_count == 0 || h->seg_count > LGY_MAX_SEGMENTS) return -EINVAL;
+
+    u64 table_size = (u64)h->seg_count * sizeof(lgy_segment_t);
+    u64 header_size = sizeof(lgy_header_t) + table_size;
+    if (h->header_size != header_size || header_size > size) return -EINVAL;
+
+    if (h->image_size == 0) return -EINVAL;
+    if (h->image_base < USER_BASE) return -EINVAL;
+    if (h->image_base + h->image_size < h->image_base) return -EINVAL;
+    if (h->image_base + h->image_size > USER_SPACE_END) return -EINVAL;
+
+    if (h->crc32 != 0 && lgy_crc32(image + header_size, size - header_size) != h->crc32)
+        return -EINVAL;
+
+    const lgy_segment_t *segs = (const lgy_segment_t *)(image + sizeof(*h));
+    int entry_ok = 0;
+
+    for (u32 i = 0; i < h->seg_count; i++) {
+        const lgy_segment_t *s = &segs[i];
+        if (s->memsz == 0 || s->filesz > s->memsz) return -EINVAL;
+        if (s->offset < header_size) return -EINVAL;
+        if (s->offset + s->filesz < s->offset || s->offset + s->filesz > size)
+            return -EINVAL;
+        if (s->flags & ~(LGY_SEG_X | LGY_SEG_W | LGY_SEG_R)) return -EINVAL;
+        if (s->align && (s->align & (s->align - 1))) return -EINVAL;
+
+        if (h->entry >= s->vaddr && h->entry < s->vaddr + s->memsz &&
+            (s->flags & LGY_SEG_X)) {
+            entry_ok = 1;
+        }
+
+        int rc = map_user_segment(pml4_phys, image, s->vaddr, s->filesz,
+                                  s->memsz, s->offset, s->flags);
+        if (rc != 0) return rc;
+    }
+
+    if (!entry_ok) return -EINVAL;
+    *entry_out = h->entry;
+    return 0;
+}
+
 int user_load_elf(u64 pml4_phys, const u8 *image, u64 size, u64 *entry_out) {
     if (size < sizeof(Elf64_Ehdr)) return -EINVAL;
     const Elf64_Ehdr *eh = (const Elf64_Ehdr *)image;
@@ -143,36 +230,12 @@ int user_load_elf(u64 pml4_phys, const u8 *image, u64 size, u64 *entry_out) {
         const Elf64_Phdr *ph = (const Elf64_Phdr *)(image + eh->phoff +
                                                     (u64)i * eh->phentsize);
         if (ph->type != PT_LOAD || ph->memsz == 0) continue;
-        if (ph->vaddr < USER_BASE) return -EINVAL;
-        if (ph->vaddr + ph->memsz < ph->vaddr) return -EINVAL;
-        if (ph->vaddr + ph->memsz > USER_SPACE_END) return -EINVAL;
         if (ph->offset + ph->filesz > size) return -EINVAL;
 
-        u64 start = ALIGN_DOWN(ph->vaddr, PAGE_SIZE);
-        u64 end = ALIGN_UP(ph->vaddr + ph->memsz, PAGE_SIZE);
-
-        for (u64 va = start; va < end; va += PAGE_SIZE) {
-            u64 pa = pmm_alloc_page();
-            if (!pa) return -ENOMEM;
-
-            u8 *dst = (u8 *)phys_to_virt(pa);
-            u64 copy_start = MAX(va, ph->vaddr);
-            u64 copy_end = MIN(va + PAGE_SIZE, ph->vaddr + ph->filesz);
-            if (copy_end > copy_start) {
-                memcpy(dst + (copy_start - va),
-                       image + ph->offset + (copy_start - ph->vaddr),
-                       copy_end - copy_start);
-            }
-
-            u64 flags = 0;
-            if (ph->flags & PF_W) flags |= PTE_WRITE;
-            if (!(ph->flags & PF_X)) flags |= PTE_NX;
-
-            if (user_map(pml4_phys, va, pa, flags) != 0) {
-                pmm_free_page(pa);
-                return -ENOMEM;
-            }
-        }
+        /* ELF PF_X/PF_W/PF_R share the LGY_SEG_* bit values. */
+        int rc = map_user_segment(pml4_phys, image, ph->vaddr, ph->filesz,
+                                  ph->memsz, ph->offset, ph->flags);
+        if (rc != 0) return rc;
     }
 
     *entry_out = eh->entry;
@@ -328,7 +391,9 @@ int user_exec(const u8 *image, u64 size, char *const argv[], char *const envp[],
     if (!pml4) return -ENOMEM;
 
     u64 entry = 0;
-    int rc = user_load_elf(pml4, image, size, &entry);
+    int rc = lgy_has_magic(image, size)
+                 ? user_load_lgy(pml4, image, size, &entry)
+                 : user_load_elf(pml4, image, size, &entry);
     if (rc != 0) {
         user_as_destroy(pml4);
         return rc;
@@ -426,10 +491,10 @@ int user_spawn_init(void) {
     static char *envp[] = { "PATH=/bin", "HOME=/", "USER=root", NULL };
 
     u64 pml4 = 0, entry = 0, rsp = 0;
-    int rc = user_exec(user_init_elf, user_init_elf_size, argv, envp,
+    int rc = user_exec(user_init_lgy, user_init_lgy_size, argv, envp,
                        &entry, &rsp, &pml4);
     if (rc != 0) {
-        kprintf("[user] cannot load init ELF (%d)\n", rc);
+        kprintf("[user] cannot load init LGY (%d)\n", rc);
         return rc;
     }
 
@@ -441,8 +506,8 @@ int user_spawn_init(void) {
     t->brk = user_brk_default();
     t->brk_end = user_brk_default();
 
-    kprintf("[user] init: %u-byte ELF, entry %p, stack %p, pml4 %p, pid %u\n",
-            (u32)user_init_elf_size, (void *)entry, (void *)rsp,
+    kprintf("[user] init: %u-byte LGY, entry %p, stack %p, pml4 %p, pid %u\n",
+            (u32)user_init_lgy_size, (void *)entry, (void *)rsp,
             (void *)pml4, t->pid);
     return 0;
 }

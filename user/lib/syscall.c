@@ -141,6 +141,15 @@ int taskinfo(mcube_task_info_t *buf, int max) {
     return fail(sys2(SYS_TASKINFO, (long)buf, max));
 }
 
+int hwinfo(mcube_hw_info_t *info) {
+    long rc = sys2(SYS_HWINFO, (long)info, (long)sizeof(*info));
+    if (rc < 0) {
+        errno = (int)-rc;
+        return -1;
+    }
+    return 0;
+}
+
 pid_t spawn(const char *path, char *const argv[], int cmd_fd, int evt_fd) {
     int fds[2] = { cmd_fd, evt_fd };
     return (pid_t)fail(__syscall6(SYS_SPAWN, (long)path, (long)argv, 0,

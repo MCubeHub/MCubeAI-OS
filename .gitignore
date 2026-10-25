@@ -1,9 +1,14 @@
-build/
+build*/
+/dist/
+/history-version/
 *.o
 *.d
 *.elf
 *.EFI
 *.img
+*.iso
+*.vhd
+*.qcow2
 *.log
 *.ppm
 *.png

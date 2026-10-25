@@ -19,6 +19,8 @@ struct block_device {
 };
 
 void block_init(void);
+void ahci_init(void);
+void block_scan_partitions(void);
 void block_register(block_device_t *dev);
 block_device_t *block_root(void);
 block_device_t *block_find(const char *name);

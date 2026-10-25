@@ -16,8 +16,10 @@
 #include <mcube/bootinfo.h>
 
 #define KERNEL_PATH       L"\\kernel.elf"
+#define INITRD_PATH       L"\\INITRD.IMG"
 #define IDENTITY_MAP_GIB  64ULL
 #define MAX_KERNEL_IMAGE  (32ULL * 1024 * 1024)
+#define MAX_INITRD_IMAGE  (64ULL * 1024 * 1024)
 #define BOOT_STACK_PAGES  16ULL
 #define CMDLINE_DEFAULT   "console=ttyS0,115200 loglevel=debug"
 
@@ -32,6 +34,12 @@ EFI_GUID gEfiGraphicsOutputProtocolGuid = {
     0x9042A9DE, 0x23DC, 0x4A38, {0x96, 0xFB, 0x7A, 0xDE, 0xD0, 0x80, 0x51, 0x6A}};
 EFI_GUID gEfiAcpi20TableGuid = {
     0x8868E871, 0xE4F1, 0x11D3, {0xBC, 0x22, 0x00, 0x80, 0xC7, 0x3C, 0x88, 0x81}};
+EFI_GUID gEfiSmbiosTableGuid = {
+    0xEB9D2D31, 0x2D88, 0x11D3, {0x9A, 0x16, 0x00, 0x90, 0x27, 0x3F, 0xC1, 0x4D}};
+EFI_GUID gEfiSmbios3TableGuid = {
+    0xF2FD1544, 0x9794, 0x4A2C, {0x99, 0x2E, 0xE5, 0xBB, 0xCF, 0x20, 0xE3, 0x94}};
+EFI_GUID gEfiFileInfoGuid = {
+    0x09576E92, 0x6D3F, 0x11D2, {0x8E, 0x39, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B}};
 
 /* ------------------------------------------------------------------ */
 /* Tiny runtime                                                       */
@@ -158,7 +166,7 @@ typedef struct {
 /* ------------------------------------------------------------------ */
 /* File loading                                                       */
 /* ------------------------------------------------------------------ */
-static EFI_FILE_PROTOCOL *open_kernel_file(EFI_HANDLE image) {
+static EFI_FILE_PROTOCOL *open_boot_file(EFI_HANDLE image, CHAR16 *path) {
     EFI_LOADED_IMAGE_PROTOCOL *li = NULL;
     EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *fs = NULL;
     EFI_FILE_PROTOCOL *root = NULL, *file = NULL;
@@ -173,13 +181,8 @@ static EFI_FILE_PROTOCOL *open_kernel_file(EFI_HANDLE image) {
     st = fs->OpenVolume(fs, (void **)&root);
     if (EFI_ERROR(st) || !root) return NULL;
 
-    st = root->Open(root, &file, KERNEL_PATH, EFI_FILE_MODE_READ, 0);
-    if (EFI_ERROR(st)) {
-        print("[MCUBOOT] cannot open \\kernel.elf, status=");
-        print_hex(st);
-        print("\n");
-        return NULL;
-    }
+    st = root->Open(root, &file, path, EFI_FILE_MODE_READ, 0);
+    if (EFI_ERROR(st)) return NULL;
     return file;
 }
 
@@ -197,6 +200,75 @@ static u8 *read_whole_file(EFI_FILE_PROTOCOL *file, u64 *out_size) {
     file->Close(file);
     *out_size = size;
     return buf;
+}
+
+static EFI_STATUS load_initrd(EFI_HANDLE image, boot_info_t *bi) {
+    EFI_FILE_PROTOCOL *f = open_boot_file(image, INITRD_PATH);
+    if (!f) {
+        print("[MCUBOOT] no INITRD.IMG, root will come from the disk\n");
+        return EFI_NOT_FOUND;
+    }
+
+    UINTN info_size = 0;
+    EFI_STATUS st = f->GetInfo(f, &gEfiFileInfoGuid, &info_size, NULL);
+    if (st != EFI_BUFFER_TOO_SMALL || info_size < sizeof(EFI_FILE_INFO)) {
+        f->Close(f);
+        print("[MCUBOOT] cannot query initrd size, status=");
+        print_hex(st);
+        print("\n");
+        return st;
+    }
+
+    EFI_FILE_INFO *info = NULL;
+    st = BS->AllocatePool(EfiLoaderData, info_size, (void **)&info);
+    if (EFI_ERROR(st) || !info) {
+        f->Close(f);
+        return st;
+    }
+    st = f->GetInfo(f, &gEfiFileInfoGuid, &info_size, info);
+    u64 fsize = info->FileSize;
+    BS->FreePool(info);
+    if (EFI_ERROR(st)) {
+        f->Close(f);
+        return st;
+    }
+    if (fsize < 16 || fsize > MAX_INITRD_IMAGE) {
+        f->Close(f);
+        print("[MCUBOOT] initrd size out of range\n");
+        return EFI_INVALID_PARAMETER;
+    }
+
+    u64 pages = (fsize + PAGE_SIZE - 1) / PAGE_SIZE;
+    EFI_PHYSICAL_ADDRESS pa = 0xFFFFFFFFULL;
+    st = BS->AllocatePages(AllocateMaxAddress, EfiLoaderData, pages, &pa);
+    if (EFI_ERROR(st)) {
+        pa = 0;
+        st = BS->AllocatePages(AllocateAnyPages, EfiLoaderData, pages, &pa);
+    }
+    if (EFI_ERROR(st)) {
+        f->Close(f);
+        return st;
+    }
+
+    u64 got = 0;
+    while (got < fsize) {
+        UINTN chunk = fsize - got;
+        st = f->Read(f, &chunk, (void *)(uptr)(pa + got));
+        if (EFI_ERROR(st)) break;
+        if (chunk == 0) { st = EFI_NOT_FOUND; break; }
+        got += chunk;
+    }
+    f->Close(f);
+    if (EFI_ERROR(st) || got != fsize) return EFI_ERROR(st) ? st : EFI_NOT_FOUND;
+
+    bi->initrd_base = pa;
+    bi->initrd_size = fsize;
+    print("[MCUBOOT] initrd ");
+    print_dec(fsize);
+    print(" bytes @ ");
+    print_hex(pa);
+    print("\n");
+    return EFI_SUCCESS;
 }
 
 static EFI_STATUS load_elf(u8 *image, u64 image_size, boot_info_t *bi) {
@@ -363,6 +435,10 @@ static void copy_memmap(EFI_MEMORY_DESCRIPTOR *desc, u32 count, u32 desc_size,
         if (base < bi->kernel_base + bi->kernel_size && base + len > bi->kernel_base) {
             type = BOOT_MEM_KERNEL;
         }
+        if (bi->initrd_size &&
+            base < bi->initrd_base + bi->initrd_size && base + len > bi->initrd_base) {
+            type = BOOT_MEM_RESERVED;
+        }
         out[n].base = base;
         out[n].length = len;
         out[n].type = type;
@@ -402,21 +478,34 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *systab) {
 
     /* ACPI RSDP. */
     u64 rsdp = 0;
+    u64 smbios = 0, smbios3 = 0;
     for (UINTN i = 0; i < systab->NumberOfTableEntries; i++) {
         EFI_GUID *g = &systab->ConfigurationTable[i].VendorGuid;
         if (g->Data1 == gEfiAcpi20TableGuid.Data1 &&
             g->Data2 == gEfiAcpi20TableGuid.Data2 &&
             g->Data3 == gEfiAcpi20TableGuid.Data3) {
             rsdp = (u64)(uptr)systab->ConfigurationTable[i].VendorTable;
-            break;
+        }
+        if (g->Data1 == gEfiSmbios3TableGuid.Data1 &&
+            g->Data2 == gEfiSmbios3TableGuid.Data2 &&
+            g->Data3 == gEfiSmbios3TableGuid.Data3) {
+            smbios3 = (u64)(uptr)systab->ConfigurationTable[i].VendorTable;
+        } else if (g->Data1 == gEfiSmbiosTableGuid.Data1 &&
+                   g->Data2 == gEfiSmbiosTableGuid.Data2 &&
+                   g->Data3 == gEfiSmbiosTableGuid.Data3) {
+            smbios = (u64)(uptr)systab->ConfigurationTable[i].VendorTable;
         }
     }
+    /* Prefer SMBIOS 3: its entry point can describe tables above 4 GiB. */
+    if (smbios3) smbios = smbios3;
     print("[MCUBOOT] RSDP ");
     print_hex(rsdp);
+    print(" SMBIOS ");
+    print_hex(smbios);
     print("\n");
 
     /* Kernel ELF. */
-    EFI_FILE_PROTOCOL *kf = open_kernel_file(image);
+    EFI_FILE_PROTOCOL *kf = open_boot_file(image, KERNEL_PATH);
     if (!kf) fail("kernel file not found", 0);
     u64 ksize = 0;
     u8 *kimage = read_whole_file(kf, &ksize);
@@ -437,6 +526,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *systab) {
     print(" size ");
     print_hex(bi->kernel_size);
     print("\n");
+
+    /* Optional initrd: a self-contained root so USB/ISO boots do not need a
+     * storage driver in the kernel. */
+    load_initrd(image, bi);
 
     /* Boot stack. */
     EFI_PHYSICAL_ADDRESS stack_base = 0;
@@ -491,6 +584,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *systab) {
         bi->fb_blue_mask = gmode->PixelInformation.Blue;
     }
     bi->rsdp = rsdp;
+    bi->smbios = smbios;
     bi->boot_cpu = 0;
     bi->cpu_count = 1;
     memcpy(bi->cmdline, CMDLINE_DEFAULT, sizeof(CMDLINE_DEFAULT));

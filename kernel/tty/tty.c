@@ -79,7 +79,12 @@ static const char g_shiftmap[128] = {
 
 static int g_shift;
 static int g_caps;
+static int g_alt;
 static int g_ext;
+
+static void push_mod(u32 code, int down) {
+    input_push_key(down ? code : (code | INPUT_KEY_RELEASE));
+}
 
 static void kbd_irq(void *frame, void *ctx) {
     UNUSED(frame);
@@ -104,18 +109,57 @@ static void kbd_irq(void *frame, void *ctx) {
 
     if (sc & 0x80) {           /* key release */
         u8 code = (u8)(sc & 0x7F);
-        if (!ext && (code == 0x2A || code == 0x36)) g_shift = 0;
+        if (!ext && (code == 0x2A || code == 0x36)) {
+            g_shift = 0;
+            push_mod(code == 0x2A ? INPUT_KEY_LSHIFT : INPUT_KEY_RSHIFT, 0);
+        } else if (!ext && code == 0x1D) {
+            push_mod(INPUT_KEY_LCTRL, 0);
+        } else if (!ext && code == 0x38) {
+            g_alt = 0;
+            push_mod(INPUT_KEY_LALT, 0);
+        } else if (ext && code == 0x1D) {
+            push_mod(INPUT_KEY_RCTRL, 0);
+        } else if (ext && code == 0x38) {
+            g_alt = 0;
+            push_mod(INPUT_KEY_RALT, 0);
+        } else if (ext && code == 0x5B) {
+            push_mod(INPUT_KEY_LWIN, 0);
+        } else if (ext && code == 0x5C) {
+            push_mod(INPUT_KEY_RWIN, 0);
+        }
         return;
     }
     if (!ext && (sc == 0x2A || sc == 0x36)) {
         g_shift = 1;
+        push_mod(sc == 0x2A ? INPUT_KEY_LSHIFT : INPUT_KEY_RSHIFT, 1);
         return;
     }
     if (!ext && sc == 0x3A) {
         g_caps = !g_caps;
         return;
     }
-    if (!ext && (sc == 0x1D || sc == 0x38)) return; /* Ctrl / Alt press */
+    if (!ext && sc == 0x1D) {
+        push_mod(INPUT_KEY_LCTRL, 1);
+        return;
+    }
+    if (!ext && sc == 0x38) {
+        g_alt = 1;
+        push_mod(INPUT_KEY_LALT, 1);
+        return;
+    }
+    if (ext && sc == 0x1D) {
+        push_mod(INPUT_KEY_RCTRL, 1);
+        return;
+    }
+    if (ext && sc == 0x38) {
+        g_alt = 1;
+        push_mod(INPUT_KEY_RALT, 1);
+        return;
+    }
+    if (ext && (sc == 0x5B || sc == 0x5C)) {
+        push_mod(sc == 0x5B ? INPUT_KEY_LWIN : INPUT_KEY_RWIN, 1);
+        return;
+    }
 
     u32 code = 0;
     if (ext) {
@@ -145,7 +189,9 @@ static void kbd_irq(void *frame, void *ctx) {
 
     if (code < 0x100) {
         char c = (char)code;
-        if (c == '\n' || c == '\b' || c == '\t' || c == 27 || c >= 32) {
+        /* Alt is a GUI modifier: do not leak Alt+Tab as a TAB on the console. */
+        if (!g_alt &&
+            (c == '\n' || c == '\b' || c == '\t' || c == 27 || c >= 32)) {
             tty_input(c);
         }
     }
@@ -153,6 +199,10 @@ static void kbd_irq(void *frame, void *ctx) {
 }
 
 void keyboard_init(void) {
+    g_shift = 0;
+    g_caps = 0;
+    g_alt = 0;
+    g_ext = 0;
     irq_register(33, kbd_irq, NULL); /* IRQ1 -> vector 0x21 */
     irq_unmask(1);
 }

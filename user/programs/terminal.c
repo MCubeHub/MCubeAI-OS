@@ -224,7 +224,7 @@ int main(int argc, char **argv, char **envp) {
             close(in[0]); close(in[1]);
             close(out[0]); close(out[1]);
             char *sh_argv[] = { "sh", NULL };
-            execv("/bin/sh.elf", sh_argv);
+            execv("/bin/sh.lgy", sh_argv);
             _exit(127);
         }
         if (pid > 0) {

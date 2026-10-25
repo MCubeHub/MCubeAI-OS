@@ -107,8 +107,8 @@ static void handle_event(const gui_event_t *ev) {
         int by = y + 38;
         if (ev->y >= by && ev->y < by + 26) {
             if (ev->x >= 14 && ev->x < 102) g_need_redraw = 1;
-            else if (ev->x >= 108 && ev->x < 196) gui_launch("/bin/taskman.elf");
-            else if (ev->x >= 202 && ev->x < 290) gui_launch("/bin/terminal.elf");
+            else if (ev->x >= 108 && ev->x < 196) gui_launch("/bin/taskman.lgy");
+            else if (ev->x >= 202 && ev->x < 290) gui_launch("/bin/terminal.lgy");
         }
         break;
     }

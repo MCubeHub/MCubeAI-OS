@@ -941,6 +941,18 @@ static long sys_kill(u32 pid, int sig) {
     return task_kill(pid, 128 + sig);
 }
 
+/* Boot-time hardware inventory. ubuf == 0 queries the ABI size. */
+static long sys_hwinfo(u64 ubuf, u64 usize) {
+    const mcube_hw_info_t *hw = hw_info_get();
+    if (hw->version != MCUBE_HWINFO_VERSION) return -ENODEV;
+    if (!ubuf) return (long)sizeof(*hw);
+    if (usize < sizeof(*hw)) return -EINVAL;
+    if (copy_to_user((void *)(uptr)ubuf, hw, sizeof(*hw)) != 0) {
+        return -EFAULT;
+    }
+    return 0;
+}
+
 /* ---- M9: AI-native channel ----------------------------------------- */
 
 /* Install a request/response pipe pair as fd 3/4 equivalents (the first two
@@ -1174,6 +1186,9 @@ void syscall_handler(syscall_frame_t *f) {
         break;
     case SYS_TASKINFO:
         ret = sys_taskinfo(f->rdi, f->rsi);
+        break;
+    case SYS_HWINFO:
+        ret = sys_hwinfo(f->rdi, f->rsi);
         break;
     case SYS_AI_CONNECT:
         ret = sys_ai_connect(f->rdi);

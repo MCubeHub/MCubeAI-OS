@@ -96,7 +96,7 @@ static void open_selected(void) {
     }
 
     char spec[GUI_TEXT_MAX + 1];
-    snprintf(spec, sizeof(spec), "/bin/editor.elf %s", full);
+    snprintf(spec, sizeof(spec), "/bin/editor.lgy %s", full);
     gui_launch(spec);
 }
 
@@ -168,6 +168,7 @@ static void handle_event(const gui_event_t *ev) {
         break;
 
     case GUI_EVT_MOUSE: {
+        if (!(ev->buttons & 1)) break;
         int row = (ev->y - 30) / ROW_H;
         int idx = g_top + row;
         if (ev->y >= 30 && idx >= 0 && idx < g_count) {

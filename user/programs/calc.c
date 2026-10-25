@@ -217,6 +217,9 @@ static void handle_event(const gui_event_t *ev) {
     }
 
     case GUI_EVT_MOUSE: {
+        /* The desktop forwards both the press and the release packet; only
+         * act on the press or every click registers twice. */
+        if (!(ev->buttons & 1)) break;
         int w = gui_width(), h = gui_height();
         for (int r = 0; r < 5; r++) {
             for (int c = 0; c < 4; c++) {

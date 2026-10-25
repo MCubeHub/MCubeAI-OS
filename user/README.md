@@ -19,14 +19,22 @@ user/
 `make image` 会：
 
 1. 编译 `user/lib/*.c|*.asm` 为公共对象；
-2. 编译 `user/programs/*.c`，每个程序与公共对象链接成独立 ELF；
-3. 把 `user/init.c` 链接为 `build/user/init.elf`，用 `tools/gen_blob.py`
-   内嵌进内核镜像；
-4. 把全部程序以 8.3 大写名复制到 ESP 的 `/BIN`（例如 `SH.ELF`、
-   `DESKTOP.ELF`、`TASKMAN.ELF`）。
+2. 编译 `user/programs/*.c`，每个程序与公共对象链接成 ELF，再由
+   `tools/lgybuild.py` 封装为 LGY 可执行文件；
+3. 把 `user/init.c` 链接为 `build/user/init.elf`，转成 `build/user/init.lgy`，
+   用 `tools/gen_blob.py` 内嵌进内核镜像；
+4. 把全部程序以 8.3 大写名复制到 ESP 的 `/BIN`（例如 `SH.LGY`、
+   `DESKTOP.LGY`、`TASKMAN.LGY`）。
 
-内核启动后 PID 1 从内嵌 ELF 运行；完成自检后 fork/exec
-`/bin/desktop.elf`，父进程再 `execv("/bin/sh.elf")` 保留串口控制台。
+内核启动后 PID 1 从内嵌 LGY 运行；完成自检后 fork/exec
+`/bin/desktop.lgy`，父进程再 `execv("/bin/sh.lgy")` 保留串口控制台。
+
+## LGY 可执行文件
+
+LGY 是 MCubeAIOS 的原生容器（`include/mcube/lgy.h`）：固定头、段表、
+段数据与 payload CRC。内核按 arch/kind 校验后直接映射段，不再在启动路径
+解析 ELF。`lgyconv` 可在系统内把 ELF64 转成原生 LGY，或把 PE32+ 封装成
+`kind=PE` 容器（PE 运行时尚在规划中，转换时会明确提示）。
 
 ## libc 约定
 
@@ -63,4 +71,4 @@ F1–F12 使用 `include/mcube/input.h` 中的 `0x100` 以上常量。
 - `$VAR`、`${VAR}`、`$?`、`$$` 展开；
 - `;` 顺序执行、`|` 管道（最多 4 段）、`>`/`>>`/`<` 重定向、`&` 后台；
 - 内建：`cd pwd exit export unset set jobs help echo true false`；
-- 外部命令从 `/bin/<name>.elf` 查找，找不到时尝试 `/bin/<name>` 与 `/<name>`。
+- 外部命令从 `/bin/<name>.lgy` 查找，找不到时尝试 `/bin/<name>` 与 `/<name>`。

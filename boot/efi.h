@@ -206,6 +206,31 @@ struct EFI_FILE_PROTOCOL {
 };
 
 typedef struct {
+    UINT16 Year;
+    UINT8  Month;
+    UINT8  Day;
+    UINT8  Hour;
+    UINT8  Minute;
+    UINT8  Second;
+    UINT8  Pad1;
+    UINT32 Nanosecond;
+    int16_t TimeZone;
+    UINT8  Daylight;
+    UINT8  Pad2;
+} EFI_TIME;
+
+typedef struct {
+    UINT64 Size;
+    UINT64 FileSize;
+    UINT64 PhysicalSize;
+    EFI_TIME CreateTime;
+    EFI_TIME LastAccessTime;
+    EFI_TIME ModificationTime;
+    UINT64 Attribute;
+    CHAR16 FileName[1];
+} EFI_FILE_INFO;
+
+typedef struct {
     UINT32 Red;
     UINT32 Green;
     UINT32 Blue;
@@ -258,6 +283,9 @@ extern EFI_GUID gEfiLoadedImageProtocolGuid;
 extern EFI_GUID gEfiSimpleFileSystemProtocolGuid;
 extern EFI_GUID gEfiGraphicsOutputProtocolGuid;
 extern EFI_GUID gEfiAcpi20TableGuid;
+extern EFI_GUID gEfiSmbiosTableGuid;
+extern EFI_GUID gEfiSmbios3TableGuid;
+extern EFI_GUID gEfiFileInfoGuid;
 
 #define EFI_FILE_MODE_READ  0x0000000000000001ULL
 #define EFI_FILE_MODE_WRITE 0x0000000000000002ULL

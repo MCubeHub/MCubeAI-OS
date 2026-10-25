@@ -3,7 +3,7 @@
  *
  * This is deliberately small but real: it parses a line into pipeline stages,
  * expands $VAR/$?/$$, forks one child per stage, wires the pipes with dup2 and
- * execs /bin/<name>.elf. Builtins run in the shell process.
+ * execs /bin/<name>.lgy. Builtins run in the shell process.
  */
 
 #include <mcube/libc.h>
@@ -277,7 +277,7 @@ static int resolve(const char *name, char *out, usize cap) {
         snprintf(out, cap, "%s", name);
         return 0;
     }
-    snprintf(out, cap, "/bin/%s.elf", name);
+    snprintf(out, cap, "/bin/%s.lgy", name);
     mcube_stat_t st;
     if (stat(out, &st) == 0 && st.type == VFS_TYPE_FILE) return 0;
 

@@ -7,6 +7,7 @@
  */
 
 #include <mcube/types.h>
+#include <mcube/bootinfo.h>
 
 #define VFS_MAX_FDS   32
 #define VFS_PATH_MAX  256
@@ -77,7 +78,7 @@ typedef struct vfs_mount_ops {
     int (*unlink)(void *fs, const char *rel);
 } vfs_mount_ops_t;
 
-int  vfs_init(void);
+int  vfs_init(const boot_info_t *bi);
 int  vfs_mount_add(const char *path, int type, void *fs,
                    const vfs_mount_ops_t *ops);
 

@@ -101,9 +101,9 @@ hmp("sendkey down", 0.4)
 hmp("sendkey ret", 3.0)
 hmp("screendump %s/gui-launch.ppm" % build, 1.0)
 
-# 3. Relative PS/2 motion back to the top-left, then click the taskbar.
+# 3. Relative PS/2 motion down to the bottom taskbar, then click a task button.
 for _ in range(24):
-    hmp("mouse_move -22 -14", 0.05)
+    hmp("mouse_move -22 16", 0.05)
 hmp("mouse_button 1", 0.2)
 hmp("mouse_button 0", 0.4)
 hmp("screendump %s/gui-click.ppm" % build, 1.0)

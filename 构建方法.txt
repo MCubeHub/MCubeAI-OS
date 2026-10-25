@@ -1,0 +1,85 @@
+图形界面启动（推荐）
+在 Windows 的 Git Bash / PowerShell / cmd 里执行：
+
+code.bat
+wsl.exe -d Debian -- bash -lc "cd /mnt/z/MCubeAIOS && make run-gui BUILD=build3"
+会弹出 QEMU 的 GTK 窗口（WSLg），1280×800 桌面。
+
+你之前那个 BUILD=build2 的 QEMU 我没动；如果两个窗口同时开，先关掉旧的即可。
+
+进系统后看新硬件信息
+桌面：按 F1 打开开始菜单 → 按 End 选到最后一个 System Info → Enter （也可以点桌面上的 System 图标）
+串口/终端里直接输入：
+code.txt
+sysinfo
+sysinfo cpu
+sysinfo mem
+sysinfo pci
+sysinfo 窗口里：F5 刷新，Esc 关闭
+看不到界面时用串口模式
+code.bat
+wsl.exe -d Debian -- bash -lc "cd /mnt/z/MCubeAIOS && make run BUILD=build3"
+串口里直接敲 sysinfo。退出 QEMU：Ctrl-A 然后按 X。
+
+如果需要重新构建
+code.bat
+wsl.exe -d Debian -- bash -lc "cd /mnt/z/MCubeAIOS && make image BUILD=build3"
+或者 Windows 下双击/运行仓库根目录的 build.bat，输入版本号，会生成完整 ISO/包和 history-verson 压缩包。
+
+当前验证状态：启动测试通过，HWINFO_OK 已输出真实 CPU/机型/内存/PCI；sysinfo 的 CLI 和桌面窗口截图也已跑到（build3/sysinfo-gui.ppm）。
+
+已编辑 15 个文件
+
+你在 PowerShell 里执行了 bash 语法（VM=xxx、/c/...、cp），所以全部报错。下面整段是 PowerShell 原生写法，可直接粘贴。
+
+1. 准备镜像
+code.powershell
+$VBOX = "C:\Program Files\Oracle\VirtualBox\VBoxManage.exe"
+$VM   = "MCubeAIOS"
+$W    = "C:\Users\X\MCubeAIOS-test"
+$DIST = "\\LGY-NAS\Worlds\MCubeAIOS\dist\MCubeAIOS-1.0.0"
+ 
+New-Item -ItemType Directory -Force -Path $W | Out-Null
+Copy-Item "$DIST\MCubeAIOS-1.0.0-esp.img" "$W\esp.img" -Force
+Copy-Item "$DIST\MCubeAIOS-1.0.0.iso"     "$W\MCubeAIOS.iso" -Force
+Remove-Item "$W\esp.vdi" -ErrorAction SilentlyContinue
+ 
+& $VBOX convertfromraw "$W\esp.img" "$W\esp.vdi" --format VDI
+2. 建 VM（EFI + PIIX3 + IDE）
+code.powershell
+& $VBOX unregistervm $VM --delete 2>$null
+ 
+& $VBOX createvm --name $VM --ostype Other_64 --register
+& $VBOX modifyvm $VM --firmware efi --chipset piix3 --memory 512 --cpus 1 --graphicscontroller vmsvga --vram 64 --mouse ps2 --keyboard ps2 --nic1 nat --nictype1 82540EM --usb off --boot1 dvd --boot2 disk --boot3 none --boot4 none --uart1 0x3F8 4 --uartmode1 file "$W\serial.log"
+& $VBOX storagectl $VM --name IDE --add ide --controller PIIX4 --bootable on
+& $VBOX storageattach $VM --storagectl IDE --port 0 --device 0 --type hdd --medium "$W\esp.vdi"
+& $VBOX storageattach $VM --storagectl IDE --port 1 --device 0 --type dvddrive --medium "$W\MCubeAIOS.iso"
+关键点：必须用 IDE。当前内核只有 PIIX IDE ATA PIO，挂到 VirtualBox 默认的 SATA 会因为找不到块设备而挂载不了根文件系统。
+
+3. 启动、取日志和截图
+code.powershell
+Remove-Item "$W\serial.log" -ErrorAction SilentlyContinue
+& $VBOX startvm $VM --type headless
+ 
+$deadline = (Get-Date).AddSeconds(150)
+while ((Get-Date) -lt $deadline) {
+    if ((Test-Path "$W\serial.log") -and (Select-String -Path "$W\serial.log" -Pattern "USER_GUI_OK" -Quiet)) { break }
+    Start-Sleep -Seconds 2
+}
+Select-String -Path "$W\serial.log" -Pattern "hw\]|HWINFO_OK|USER_GUI_OK|block\]" | Select-Object -Last 15
+& $VBOX controlvm $VM screenshotpng "$W\screen.png"
+screen.png 就是桌面截图。要看实时窗口，把 --type headless 改成 --type gui。
+
+4. 纯命令行注入按键（输入 sysinfo + 回车）
+code.powershell
+& $VBOX controlvm $VM keyboardputscancode 1f 9f 15 95 1f 9f 17 97 31 b1 21 a1 18 98 1c 9c
+& $VBOX controlvm $VM screenshotpng "$W\sysinfo.png"
+5. 关机 / 清理
+code.powershell
+& $VBOX controlvm $VM poweroff
+& $VBOX unregistervm $VM --delete
+排错提示：
+
+若窗口提示 FATAL: No bootable medium found：确认 ISO 是 dvddrive、启动顺序 --boot1 dvd。走 ISO 启动是为了绕开 VirtualBox EFI 对“无分区表 FAT32 超级软盘”的不稳定支持；内核启动后仍会从 IDE 主盘（esp.vdi）读取 /BIN 和 /MODELS。
+若 VBoxManage 报 VT-x is not available，需要在 Windows 功能里确认 Hyper-V/虚拟机平台与 VirtualBox 的共存设置。
+网络不用改：VirtualBox NAT 也是 10.0.2.15/24、网关 10.0.2.2、DNS 10.0.2.3，和 QEMU user-net 一致。

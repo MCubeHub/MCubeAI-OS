@@ -35,10 +35,22 @@ sudo apt install build-essential nasm qemu-system-x86 xorriso mtools gdb \
 
 make            # 生成 build/esp.img（FAT32 EFI 系统分区）
 make test       # QEMU 无头启动，断言串口出现全部里程碑标记
+make iso        # UEFI El Torito ISO（也可 dd 到 U 盘）
+make disk       # MBR 磁盘镜像（硬盘/U 盘通用）+ VHD/QCOW2
+make disk-gpt   # 同一布局的 GPT 版本
+make test-disk  # 从分区硬盘镜像启动并跑完整验收
+make test-usb   # 模拟 U 盘（xHCI + USB mass storage）启动
+make test-iso   # 从 ISO 启动
 make run-gui    # 带窗口启动（需要 X/Wayland，WSLg 可用）
 make screenshot # 无头启动桌面并截图到 build/screen.ppm（PNG 用 tools/ppm2png.py）
 make gui-test   # 用 QEMU monitor 驱动键盘/鼠标，截取菜单、启动、点击三张图
 ```
+
+所有镜像共用同一条启动链：UEFI loader 读取 `\INITRD.IMG`（内置 kernel、
+`/bin/*.lgy`、AI 模型）并交给内核；内核优先挂载启动盘上的 FAT32 ESP，
+找不到时自动挂载 initrd tmpfs 作为 `/`。因此 U 盘和 ISO 不依赖内核里的
+USB/光驱驱动也能进入完整桌面；硬盘镜像则通过 MBR/GPT 分区扫描挂载
+`sda1`，自检写入的 `/TEST.TXT` 会持久保存在分区内。
 
 `make test` 由 `tools/test.sh` 驱动：出现最后一个标记 `USER_GUI_OK` 后立即
 退出并断言全部里程碑标记；`RUN_TIMEOUT`（默认 90 秒）只是异常时的上限。

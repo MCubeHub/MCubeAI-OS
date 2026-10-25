@@ -23,6 +23,7 @@
 #include <mcube/vfs.h>
 #include <mcube/tty.h>
 #include <mcube/net.h>
+#include <mcube/hwinfo.h>
 
 #define MCUBE_VERSION "0.1.0"
 #define MCUBE_CODENAME "Genesis"
@@ -153,6 +154,8 @@ void kernel_main(boot_info_t *bi) {
     banner(bi);
     check_rsdp(bi);
     dump_memory_map(bi);
+    hw_info_init(bi);
+    hw_info_print_summary();
 
     kprintf("[cpu] loading GDT + TSS...\n");
     gdt_init();
@@ -176,7 +179,7 @@ void kernel_main(boot_info_t *bi) {
     block_dump();
     tty_init();
     input_init();
-    if (vfs_init() == 0) {
+    if (vfs_init(bi) == 0) {
         vfs_selftest();
     } else {
         kprintf("[vfs] filesystem self test skipped (root not mounted)\n");
@@ -213,6 +216,11 @@ void kernel_main(boot_info_t *bi) {
     kprintf("[init] kernel %s (%s) boot complete, %u MiB usable\n",
             MCUBE_VERSION, MCUBE_CODENAME, (u32)(usable_bytes(bi) / MiB));
     kprintf("\nMCUBE_BOOT_OK\n");
+
+    /* Show the hacker boot sequence while the serial console keeps logging.
+     * The kernel console stops painting here; user space owns the screen from
+     * the moment the desktop maps it. */
+    fb_boot_splash((u32)(usable_bytes(bi) / MiB));
 
     /* Hand the CPU to the round-robin scheduler. kernel_main's stack becomes
      * the abandoned boot context; all further work runs in kernel threads. */

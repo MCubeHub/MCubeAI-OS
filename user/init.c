@@ -25,7 +25,7 @@ static int run_shell_test(void) {
         return -1;
     }
     if (pid == 0) {
-        execv("/bin/sh.elf", argv);
+        execv("/bin/sh.lgy", argv);
         printf("USER_SHELL_FAIL: exec\n");
         _exit(127);
     }
@@ -49,7 +49,7 @@ static int run_redirect_test(void) {
     pid_t pid = fork();
     if (pid < 0) return -1;
     if (pid == 0) {
-        execv("/bin/sh.elf", argv);
+        execv("/bin/sh.lgy", argv);
         _exit(127);
     }
     int status = -1;
@@ -125,7 +125,7 @@ static void run_ai_tests(void) {
     }
     if (pid == 0) {
         static char *argv[] = { "aiosd", NULL };
-        execv("/bin/aiosd.elf", argv);
+        execv("/bin/aiosd.lgy", argv);
         printf("AI_DAEMON_EXEC_FAIL\n");
         _exit(127);
     }
@@ -137,14 +137,29 @@ static void run_ai_tests(void) {
 
     char buf[4096];
     static char *tool_argv[] = { "ai", "exec", "system info", NULL };
-    int n = capture("/bin/ai.elf", tool_argv, buf, sizeof(buf));
+    int n = capture("/bin/ai.lgy", tool_argv, buf, sizeof(buf));
     if (n > 0 && strstr(buf, "-> sys.info")) printf("AI_TOOL_OK\n");
     else printf("AI_TOOL_FAIL\n");
 
     static char *chat_argv[] = { "ai", "exec", "hello", NULL };
-    n = capture("/bin/ai.elf", chat_argv, buf, sizeof(buf));
+    n = capture("/bin/ai.lgy", chat_argv, buf, sizeof(buf));
     if (n > 16) printf("AI_CHAT_OK\n");
     else printf("AI_CHAT_FAIL\n");
+}
+
+/* Hardware inventory is collected at boot; this checks the user-space ABI and
+ * gives the boot log a real CPU/firmware/RAM summary instead of a fixed one. */
+static int run_hw_test(void) {
+    mcube_hw_info_t hw;
+    if (hwinfo(&hw) != 0) {
+        printf("HWINFO_FAIL: syscall\n");
+        return -1;
+    }
+    printf("HWINFO_OK: %s | %s %s | %u MiB | %u pci\n",
+           hw.cpu.brand[0] ? hw.cpu.brand : hw.cpu.vendor,
+           hw.system_vendor, hw.system_product,
+           (u32)(hw.total_ram_bytes / (1024ULL * 1024ULL)), hw.pci_count);
+    return 0;
 }
 
 int main(int argc, char **argv, char **envp) {
@@ -184,6 +199,7 @@ int main(int argc, char **argv, char **envp) {
     }
 
     mcube_stat_t st;
+    /* The kernel image stays ELF; only user-space executables are LGY. */
     if (stat("/kernel.elf", &st) == 0 && st.size > 0) printf("USER_STAT_OK\n");
 
     int tfd = open("/dev/ttyS0", VFS_O_WRONLY);
@@ -241,6 +257,7 @@ int main(int argc, char **argv, char **envp) {
     if (run_redirect_test() == 0) printf("USER_REDIR_OK\n");
 
     run_ai_tests();
+    run_hw_test();
 
     sleep_ms(40);
     printf("USER_INIT_OK\n");
@@ -250,14 +267,14 @@ int main(int argc, char **argv, char **envp) {
     pid_t dpid = fork();
     if (dpid == 0) {
         static char *desk_argv[] = { "desktop", NULL };
-        execv("/bin/desktop.elf", desk_argv);
+        execv("/bin/desktop.lgy", desk_argv);
         printf("USER_DESKTOP_EXEC_FAIL\n");
         _exit(127);
     }
 
     /* Hand the console to an interactive shell. */
     static char *sh_argv[] = { "sh", NULL };
-    execv("/bin/sh.elf", sh_argv);
+    execv("/bin/sh.lgy", sh_argv);
 
     printf("USER_EXEC_FAIL\n");
     _exit(1);

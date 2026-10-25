@@ -63,6 +63,7 @@ int   input_poll(input_event_t *ev);/* 1 event, 0 empty, -1 error        */
 int   poll(mcube_pollfd_t *fds, int nfds, int timeout_ms);
 int   mc_time(mcube_time_t *ts);
 int   taskinfo(mcube_task_info_t *buf, int max);
+int   hwinfo(mcube_hw_info_t *info);
 pid_t spawn(const char *path, char *const argv[], int cmd_fd, int evt_fd);
 
 void *brk(void *addr);

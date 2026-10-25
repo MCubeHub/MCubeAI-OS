@@ -427,6 +427,146 @@ static const vfs_mount_ops_t g_tmpfs_mount_ops = {
     .unlink = tmpfs_m_unlink,
 };
 
+/* ---- initrd (MCIR archive) ----------------------------------------- */
+
+/* The loader hands us a compact archive built by tools/mkinitrd.py. It is
+ * mounted as the root tmpfs when the boot medium (USB stick, CD) has no
+ * kernel-visible block device or partition. */
+#define MCIR_MAGIC 0x5249434DU /* "MCIR" */
+
+static tmpfs_fs_t g_rootfs;
+
+static tmpfs_node_t *rootfs_mkdir(tmpfs_fs_t *fs, const char *path) {
+    tmpfs_node_t *n = fs->root;
+    const char *p = path;
+
+    while (*p) {
+        char comp[VFS_NAME_MAX];
+        usize k = 0;
+        while (*p == '/') p++;
+        if (!*p) break;
+        while (*p && *p != '/') {
+            if (k + 1 >= sizeof(comp)) return NULL;
+            comp[k++] = *p++;
+        }
+        comp[k] = 0;
+
+        tmpfs_node_t *c = tmpfs_child(n, comp);
+        if (!c) {
+            c = kzalloc(sizeof(*c));
+            if (!c) return NULL;
+            strncpy(c->name, comp, sizeof(c->name) - 1);
+            c->type = VFS_TYPE_DIR;
+            c->parent = n;
+            c->next = n->children;
+            n->children = c;
+        } else if (c->type != VFS_TYPE_DIR) {
+            return NULL;
+        }
+        n = c;
+    }
+    return n;
+}
+
+static int rootfs_add(tmpfs_fs_t *fs, const char *path, const u8 *data, u64 len) {
+    const char *base = path;
+    for (const char *p = path; *p; p++) {
+        if (*p == '/') base = p + 1;
+    }
+    if (!*base) return -EINVAL;
+
+    char dir[VFS_PATH_MAX];
+    usize dlen = (usize)(base - path);
+    if (dlen >= sizeof(dir)) return -ENAMETOOLONG;
+    memcpy(dir, path, dlen);
+    dir[dlen] = 0;
+
+    tmpfs_node_t *parent = rootfs_mkdir(fs, dir);
+    if (!parent) return -ENOMEM;
+    if (tmpfs_child(parent, base)) return -EEXIST;
+
+    tmpfs_node_t *n = kzalloc(sizeof(*n));
+    if (!n) return -ENOMEM;
+    strncpy(n->name, base, sizeof(n->name) - 1);
+    n->type = VFS_TYPE_FILE;
+    if (len) {
+        n->data = kmalloc((usize)len);
+        if (!n->data) {
+            kfree(n);
+            return -ENOMEM;
+        }
+        memcpy(n->data, data, (usize)len);
+    }
+    n->size = len;
+    n->cap = len;
+    n->parent = parent;
+    n->next = parent->children;
+    parent->children = n;
+    return 0;
+}
+
+static int mcir_mount(const u8 *base, u64 size) {
+    if (size < 16 || memcmp(base, "MCIR", 4) != 0) {
+        kprintf("[vfs] initrd: bad magic\n");
+        return -EINVAL;
+    }
+
+    u32 version, count;
+    memcpy(&version, base + 4, 4);
+    memcpy(&count, base + 8, 4);
+    if (version != 1 || count == 0 || count > 4096) {
+        kprintf("[vfs] initrd: unsupported header (v%u, %u entries)\n",
+                version, count);
+        return -EINVAL;
+    }
+
+    g_rootfs.root = kzalloc(sizeof(*g_rootfs.root));
+    if (!g_rootfs.root) return -ENOMEM;
+    g_rootfs.root->type = VFS_TYPE_DIR;
+
+    u64 off = 16;
+    u32 files = 0;
+    for (u32 i = 0; i < count; i++) {
+        u16 name_len;
+        u8 type, flags;
+        u32 data_len, reserved;
+        if (off + 12 > size) return -EINVAL;
+        memcpy(&name_len, base + off, 2);
+        memcpy(&type, base + off + 2, 1);
+        memcpy(&flags, base + off + 3, 1);
+        memcpy(&data_len, base + off + 4, 4);
+        memcpy(&reserved, base + off + 8, 4);
+        (void)flags;
+        (void)reserved;
+        off += 12;
+
+        if (name_len == 0 || name_len >= VFS_PATH_MAX || off + name_len > size) {
+            return -EINVAL;
+        }
+        char name[VFS_PATH_MAX];
+        memcpy(name, base + off, name_len);
+        name[name_len] = 0;
+        off += (u64)name_len;
+        off = ALIGN_UP(off, 4);
+        if (off + data_len > size || type != 2) {
+            return -EINVAL;
+        }
+
+        int rc = rootfs_add(&g_rootfs, name, base + off, data_len);
+        if (rc != 0) {
+            kprintf("[vfs] initrd: cannot add %s: %d\n", name, rc);
+            return rc;
+        }
+        files++;
+        off = ALIGN_UP(off + data_len, 4);
+    }
+
+    if (vfs_mount_add("/", 4, &g_rootfs, &g_tmpfs_mount_ops) != 0) return -ENOMEM;
+    kprintf("[vfs] mounted initrd tmpfs at / (%u files, %u KiB)\n",
+            files, (u32)(size / KiB));
+    return 0;
+}
+
 /* ---- devfs ---------------------------------------------------------- */
 
 typedef struct dev_node {
@@ -824,22 +964,46 @@ int vfs_selftest(void) {
 
 /* ---- init ----------------------------------------------------------- */
 
-int vfs_init(void) {
+static int root_has_payload(void) {
+    vfs_stat_t st;
+    if (vfs_stat("/bin/desktop.lgy", &st) != 0) return 0;
+    return st.type == VFS_TYPE_FILE && st.size > 0;
+}
+
+int vfs_init(const boot_info_t *bi) {
     g_mount_count = 0;
+    int root_ok = 0;
 
     block_device_t *dev = block_root();
-    int rc = -ENODEV;
     if (dev) {
-        rc = fat32_mount(&g_fat, dev);
+        int rc = fat32_mount(&g_fat, dev);
         if (rc == 0) {
             fat32_dump(&g_fat);
-            vfs_mount_add("/", 1, &g_fat, &g_fat_mount_ops);
-            kprintf("[vfs] mounted FAT32 %s at /\n", dev->name);
+            if (vfs_mount_add("/", 1, &g_fat, &g_fat_mount_ops) == 0 &&
+                root_has_payload()) {
+                kprintf("[vfs] mounted FAT32 %s at /\n", dev->name);
+                root_ok = 1;
+            } else {
+                g_mount_count = 0;
+                kprintf("[vfs] FAT32 %s has no /bin/desktop.lgy, "
+                        "trying initrd\n", dev->name);
+            }
         } else {
             kprintf("[vfs] FAT32 mount failed: %d\n", rc);
         }
     } else {
-        kprintf("[vfs] no block device, root filesystem unavailable\n");
+        kprintf("[vfs] no block device, trying initrd\n");
+    }
+
+    if (!root_ok) {
+        if (bi && bi->initrd_base && bi->initrd_size) {
+            if (mcir_mount((const u8 *)phys_to_virt(bi->initrd_base),
+                           bi->initrd_size) == 0) {
+                root_ok = 1;
+            }
+        } else {
+            kprintf("[vfs] initrd payload unavailable\n");
+        }
     }
 
     g_tmpfs.root = kzalloc(sizeof(*g_tmpfs.root));
@@ -850,6 +1014,7 @@ int vfs_init(void) {
 
     vfs_mount_add("/dev", 3, NULL, &g_devfs_mount_ops);
 
-    kprintf("[vfs] mounts: / (fat32), /tmp (tmpfs), /dev (devfs)\n");
-    return rc;
+    kprintf("[vfs] mounts: %s, /tmp (tmpfs), /dev (devfs)\n",
+            root_ok ? "/ (ready)" : "/ (missing)");
+    return root_ok ? 0 : -ENODEV;
 }

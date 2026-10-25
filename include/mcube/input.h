@@ -35,6 +35,19 @@
 #define INPUT_KEY_F11    0x11Au
 #define INPUT_KEY_F12    0x11Bu
 
+/* Modifier keys report their own press/release events so a display server can
+ * implement Alt+Tab, Alt+F4 and the Windows key. Printable keys keep emitting
+ * plain ASCII for terminal consumers. */
+#define INPUT_KEY_LSHIFT 0x120u
+#define INPUT_KEY_RSHIFT 0x121u
+#define INPUT_KEY_LCTRL  0x122u
+#define INPUT_KEY_RCTRL  0x123u
+#define INPUT_KEY_LALT   0x124u
+#define INPUT_KEY_RALT   0x125u
+#define INPUT_KEY_LWIN   0x126u
+#define INPUT_KEY_RWIN   0x127u
+#define INPUT_KEY_RELEASE 0x80000000u
+
 #define INPUT_QUEUE_SIZE 256
 
 typedef struct PACKED input_event {

@@ -117,7 +117,7 @@ static int ata_write(block_device_t *dev, u64 lba, u32 count, const void *buf) {
     return ata_wait_not_busy();
 }
 
-void block_init(void) {
+static void ata_probe(void) {
     u16 id[256];
     if (ata_identify(id) != 0) {
         kprintf("[block] ATA: no drive on primary master\n");
@@ -140,4 +140,12 @@ void block_init(void) {
 
     kprintf("[block] ATA PIO drive ready: %u sectors (%u MiB)\n",
             (u32)sectors, (u32)(sectors * BLOCK_SECTOR_SIZE / MiB));
+}
+
+void block_init(void) {
+    /* PIIX IDE is probed first so QEMU's ESP stays sda; AHCI disks then come
+     * up as sdb, sdc, ... and become the root device on SATA-only machines. */
+    ata_probe();
+    ahci_init();
+    block_scan_partitions();
 }

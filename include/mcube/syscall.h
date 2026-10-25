@@ -15,6 +15,7 @@
 #include <mcube/types.h>
 #include <mcube/fb.h>
 #include <mcube/input.h>
+#include <mcube/hwinfo.h>
 
 #define SYS_READ      0
 #define SYS_WRITE     1
@@ -64,6 +65,7 @@
 #define SYS_TIME       0x104
 #define SYS_TASKINFO   0x105
 #define SYS_SPAWN      0x106
+#define SYS_HWINFO     0x107
 
 /* Socket constants mirrored from <mcube/net.h> so user programs only need
  * this header. Identical values make the duplicate definitions harmless. */

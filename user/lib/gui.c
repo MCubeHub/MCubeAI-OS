@@ -64,7 +64,7 @@ int gui_init(const char *title, int want_w, int want_h) {
     g_h = want_h;
     if (send_cmd(&cmd) != 0) return -1;
 
-    /* The desktop replies with the tile it assigned to us. */
+    /* The desktop replies with the size it assigned to our window. */
     for (;;) {
         gui_event_t ev;
         int rc = gui_wait(&ev, 3000);
@@ -179,8 +179,8 @@ int gui_wait(gui_event_t *ev, int timeout_ms) {
         return -1;
     }
     /* Keep the cached geometry in sync with every resize, not just the one
-     * consumed during gui_init(): the desktop re-tiles when windows open or
-     * close. */
+     * consumed during gui_init(): the user can resize or maximize a window at
+     * any time. */
     if (ev->type == GUI_EVT_RESIZE) {
         if ((i32)ev->w > 0) g_w = (int)ev->w;
         if ((i32)ev->h > 0) g_h = (int)ev->h;
