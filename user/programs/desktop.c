@@ -128,6 +128,10 @@ typedef struct {
     pid_t pid;
     int cmd_fd;
     int evt_fd;
+    /* One event may be parked here when the client's pipe is full, so the
+     * compositor can retry on the next pass instead of blocking on write(). */
+    int pend_evt;
+    gui_event_t pend;
     char title[64];
     int ready;
     int x, y, w, h;        /* content rectangle in screen coordinates */
@@ -1254,13 +1258,31 @@ static void send_event(int slot, u32 type, u32 code, int x, int y,
     ev.w = (u32)(w > 0 ? w : 0);
     ev.h = (u32)(h > 0 ? h : 0);
 
-    const u8 *p = (const u8 *)&ev;
-    size_t left = sizeof(ev);
-    while (left) {
-        ssize_t n = write(win->evt_fd, p, left);
-        if (n <= 0) return;
-        p += n;
-        left -= (size_t)n;
+    /* Never block here. A client that stops draining its event pipe used to
+     * freeze the whole compositor in pipe_write(), which also stalled the
+     * clock, the taskbar and every other window. write_nb() is all-or-nothing,
+     * so an event is either delivered intact or handled below. */
+    if (write_nb(win->evt_fd, &ev, sizeof(ev)) == (ssize_t)sizeof(ev)) return;
+
+    /* Pipe full: park one event for the next loop pass. Motion is coalesced
+     * (only the newest pointer position matters) and never overwrites a
+     * structural event such as a key or resize. */
+    if (win->pend_evt && !(type == GUI_EVT_MOUSE && win->pend.type == GUI_EVT_MOUSE)) {
+        return;
+    }
+    win->pend = ev;
+    win->pend_evt = 1;
+}
+
+/* Retry parked events once per loop pass. Called after input handling so the
+ * newest motion replaces whatever was pending before composition. */
+static void flush_events(void) {
+    for (int i = 0; i < MAX_WINS; i++) {
+        win_t *w = &g_wins[i];
+        if (!w->used || !w->pend_evt || w->evt_fd < 0) continue;
+        if (write_nb(w->evt_fd, &w->pend, sizeof(w->pend)) == (ssize_t)sizeof(w->pend)) {
+            w->pend_evt = 0;
+        }
     }
 }
 
@@ -5077,6 +5099,7 @@ int main(int argc, char **argv, char **envp) {
 
         input_event_t iev;
         while (input_poll(&iev) == 1) handle_input(&iev);
+        flush_events();
 
         /* Asleep: the framebuffer is black and nothing needs composing. The
          * poll above already rate-limits the loop to one pass per 16 ms. */

@@ -83,6 +83,13 @@ u64 usb_dma_alloc(u32 pages) {
     return phys;
 }
 
+/* Return a run obtained from usb_dma_alloc(). Drivers call this from their
+ * dev_close() and from the failure paths inside dev_open()/intr_open(). */
+void usb_dma_free(u64 phys, u32 pages) {
+    if (!phys) return;
+    pmm_free_pages(phys, pages ? pages : 1);
+}
+
 /* Identity window the loader built at MCUBE_DIRECT_MAP_BASE. */
 #define USB_IDENTITY_WINDOW (64ULL << 30)
 
@@ -792,10 +799,15 @@ static void usb_log_bind(const usb_device_t *dev) {
 
 /* ---- enumeration ----------------------------------------------------- */
 
+/* Enumeration works on a scratch device, not on the next free table entry.
+ * A failed attempt therefore cannot leave half-initialised state behind for
+ * the next hot-plug scan, and g_devices[] only ever holds bound devices. */
+static usb_device_t g_enum_dev;
+
 static void usb_enumerate(usb_controller_t *c, int port) {
     if (g_dev_count >= USB_MAX_DEVICES) return;
 
-    usb_device_t *dev = &g_devices[g_dev_count];
+    usb_device_t *dev = &g_enum_dev;
     memset(dev, 0, sizeof(*dev));
     dev->ctrl = c;
     dev->port = (u8)port;
@@ -825,7 +837,7 @@ static void usb_enumerate(usb_controller_t *c, int port) {
         kprintf("[usb] %s port %d: GET_DESCRIPTOR(device) failed\n",
                 c->ops->name, port);
         usb_diag_note("%s p%d: no device descriptor", c->ops->name, port);
-        return;
+        goto fail;
     }
     dev->vendor = dd.idVendor;
     dev->product = dd.idProduct;
@@ -838,7 +850,7 @@ static void usb_enumerate(usb_controller_t *c, int port) {
     if (c->ops->set_address(c, dev, addr) != 0) {
         kprintf("[usb] %s port %d: SET_ADDRESS failed\n", c->ops->name, port);
         usb_diag_note("%s p%d: SET_ADDRESS failed", c->ops->name, port);
-        return;
+        goto fail;
     }
 
     kprintf("[usb] device %04x:%04x on %s port %d, addr %u\n",
@@ -851,7 +863,7 @@ static void usb_enumerate(usb_controller_t *c, int port) {
         cdesc.bLength < 9) {
         kprintf("[usb] %s port %d: GET_DESCRIPTOR(config) failed\n",
                 c->ops->name, port);
-        return;
+        goto fail;
     }
 
     u32 total = cdesc.wTotalLength;
@@ -862,7 +874,7 @@ static void usb_enumerate(usb_controller_t *c, int port) {
     if (got < 0) {
         kprintf("[usb] %s port %d: config descriptor read failed\n",
                 c->ops->name, port);
-        return;
+        goto fail;
     }
 
     usb_hid_info_t hi;
@@ -875,13 +887,13 @@ static void usb_enumerate(usb_controller_t *c, int port) {
                     NULL, 0) != 0) {
         kprintf("[usb] %s port %d: SET_CONFIGURATION(%u) failed\n",
                 c->ops->name, port, (u32)cfg_value);
-        return;
+        goto fail;
     }
 
     if (!hi.found) {
         kprintf("[usb] %04x:%04x is not a HID interface, ignored\n",
                 dev->vendor, dev->product);
-        return;
+        goto fail;
     }
 
     u32 rlen = hi.report_len;
@@ -911,7 +923,7 @@ static void usb_enumerate(usb_controller_t *c, int port) {
         } else {
             kprintf("[usb] hid %04x:%04x has no pointer/touch/keyboard usage, "
                     "ignored\n", dev->vendor, dev->product);
-            return;
+            goto fail;
         }
     }
 
@@ -924,17 +936,25 @@ static void usb_enumerate(usb_controller_t *c, int port) {
                 dev->vendor, dev->product);
         usb_diag_note("%04x:%04x: no interrupt endpoint", dev->vendor,
                  dev->product);
-        return;
+        goto fail;
     }
 
     usb_log_bind(dev);
-    g_dev_count++;
+    g_devices[g_dev_count++] = *dev;
 
     if (dev->kind == USB_HID_TOUCH || dev->kind == USB_HID_POINTER) {
         kprintf("USER_USB_TOUCH_OK\n");
     } else if (dev->kind == USB_HID_KEYBOARD) {
         kprintf("USER_USB_KEYBOARD_OK\n");
     }
+    return;
+
+fail:
+    /* One place for every failure above: the controller releases the slot
+     * (Disable Slot on xHCI), the DMA pages and the port flags it allocated.
+     * The scratch device is then wiped so nothing carries over. */
+    if (c->ops->dev_close) c->ops->dev_close(c, dev);
+    memset(dev, 0, sizeof(*dev));
 }
 
 /* ---- init / runtime poll ---------------------------------------------- */

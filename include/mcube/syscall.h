@@ -71,6 +71,7 @@
 #define SYS_NETINFO    0x10A
 #define SYS_BATTERY    0x10B
 #define SYS_USBINFO    0x10C
+#define SYS_WRITE_NB   0x10D
 
 /* SYS_POWER actions. */
 #define MCUBE_POWER_REBOOT   0

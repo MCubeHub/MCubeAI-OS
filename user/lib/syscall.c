@@ -49,6 +49,10 @@ ssize_t write(int fd, const void *buf, size_t len) {
     return (ssize_t)fail(sys3(SYS_WRITE, fd, (long)buf, (long)len));
 }
 
+ssize_t write_nb(int fd, const void *buf, size_t len) {
+    return (ssize_t)fail(sys3(SYS_WRITE_NB, fd, (long)buf, (long)len));
+}
+
 int stat(const char *path, mcube_stat_t *st) {
     return fail(sys2(SYS_STAT, (long)path, (long)st));
 }

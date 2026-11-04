@@ -147,6 +147,12 @@ typedef struct usb_hcd_ops {
     int  (*port_count)(usb_controller_t *c);
     int  (*port_connected)(usb_controller_t *c, int port);
     int  (*dev_open)(usb_controller_t *c, int port, usb_device_t *dev);
+    /* Opposite of dev_open: release the slot/frame, DMA pages and port state
+     * that dev_open()/intr_open() allocated. Called on every enumeration
+     * failure path (and on detach, when a controller implements it) so a
+     * half-initialised device cannot pin memory until reboot. Optional, but a
+     * driver that allocates in dev_open() must provide it. */
+    void (*dev_close)(usb_controller_t *c, usb_device_t *dev);
     int  (*set_address)(usb_controller_t *c, usb_device_t *dev, u8 address);
     int  (*control)(usb_controller_t *c, usb_device_t *dev,
                     const usb_setup_t *setup, void *buf, u32 len);
@@ -235,6 +241,7 @@ void usb_diag_note(const char *fmt, ...);
 int  usb_register_controller(const usb_hcd_ops_t *ops, void *priv,
                              u8 bus, u8 slot, u8 func);
 u64  usb_dma_alloc(u32 pages);      /* zeroed, page aligned, physical address */
+void usb_dma_free(u64 phys, u32 pages);
 
 /* Map a controller BAR into the kernel direct map. The loader only builds the
  * identity window below 64 GiB, and UEFI is free to park a 64-bit BAR higher

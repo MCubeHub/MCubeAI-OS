@@ -74,6 +74,7 @@
 #define TRB_STATUS      4
 #define TRB_LINK        6
 #define TRB_ENABLE_SLOT 9
+#define TRB_DISABLE_SLOT 10
 #define TRB_ADDRESS_DEV 11
 #define TRB_CONFIG_EP   12
 #define TRB_EVAL_CTX    13
@@ -411,6 +412,51 @@ static int xhci_set_address(usb_controller_t *c, usb_device_t *dev,
     return 0;
 }
 
+static int xhci_dev_open(usb_controller_t *c, int port, usb_device_t *dev);
+
+/* Release one device: Disable Slot (so the controller stops DMA into these
+ * rings) and return every page xhci_dev_open()/xhci_intr_open() allocated.
+ * Every failure path funnels through here, which is what keeps a port that
+ * fails enumeration from leaking memory on each 750 ms rescan. */
+static void xhci_dev_release(xhci_ctrl_t *hc, xhci_dev_t *d) {
+    if (!d) return;
+
+    if (d->slot && d->slot <= XHCI_MAX_SLOTS) {
+        if (hc->slots[d->slot] == d) hc->slots[d->slot] = NULL;
+        if (hc->dcbaa) hc->dcbaa[d->slot] = 0;
+        u64 trb = 0;
+        xhci_ring_cmd(hc, 0, 0,
+                      TRB_TYPE(TRB_DISABLE_SLOT) | TRB_SLOT(d->slot), &trb);
+        xhci_wait_cmd(hc, trb, NULL);
+        d->slot = 0;
+    }
+
+    usb_dma_free(d->ep0.phys, 1);
+    usb_dma_free(d->dev_ctx_phys, 2);
+    usb_dma_free(d->in_ctx_phys, 2);
+    usb_dma_free(d->irq.phys, 1);
+    usb_dma_free(d->irq_buf_phys, 1);
+    kfree(d);
+}
+
+static void xhci_dev_close(usb_controller_t *c, usb_device_t *dev) {
+    xhci_ctrl_t *hc = (xhci_ctrl_t *)c->priv;
+    xhci_dev_t *d = dev ? (xhci_dev_t *)dev->hcd_priv : NULL;
+    if (!hc || !d) return;
+
+    dev->hcd_priv = NULL;
+    xhci_dev_release(hc, d);
+
+    /* Leave the port powered and clear the sticky change bits. A full port
+     * reset here would immediately queue the same failing device again; the
+     * normal rescan path still retries it after a replug. */
+    if (dev->port > 0 && dev->port <= (u8)hc->ports) {
+        u32 reg = OP_PORTSC(dev->port - 1);
+        u32 v = xr(hc->op, reg);
+        xw(hc->op, reg, (v & ~PS_PLS_MASK) | PS_CHANGE_MASK | (v & PS_PP));
+    }
+}
+
 static int xhci_dev_open(usb_controller_t *c, int port, usb_device_t *dev) {
     xhci_ctrl_t *hc = (xhci_ctrl_t *)c->priv;
     u32 reg = OP_PORTSC(port - 1);
@@ -465,7 +511,7 @@ static int xhci_dev_open(usb_controller_t *c, int port, usb_device_t *dev) {
     d->in_ctx_phys = usb_dma_alloc(2);
     u64 ep0_phys = usb_dma_alloc(1);
     if (!d->dev_ctx_phys || !d->in_ctx_phys || !ep0_phys) {
-        kfree(d);
+        xhci_dev_release(hc, d);
         return -1;
     }
     d->dev_ctx = phys_to_virt(d->dev_ctx_phys);
@@ -478,14 +524,14 @@ static int xhci_dev_open(usb_controller_t *c, int port, usb_device_t *dev) {
     u64 trb = 0;
     xhci_ring_cmd(hc, 0, 0, TRB_TYPE(TRB_ENABLE_SLOT), &trb);
     if (xhci_wait_cmd(hc, trb, &slot_id) != 0) {
-        kfree(d);
+        xhci_dev_release(hc, d);
         return -1;
     }
     d->slot = (u8)slot_id;
     if (d->slot == 0 || d->slot > hc->max_slots || d->slot > XHCI_MAX_SLOTS) {
         kprintf("[usb] xhci: bad slot %u (max %u)\n", (u32)d->slot,
                 hc->max_slots);
-        kfree(d);
+        xhci_dev_release(hc, d);
         return -1;
     }
 
@@ -512,9 +558,7 @@ static int xhci_dev_open(usb_controller_t *c, int port, usb_device_t *dev) {
     xhci_ring_cmd(hc, d->in_ctx_phys, 0,
                   TRB_TYPE(TRB_ADDRESS_DEV) | TRB_SLOT(d->slot), &trb);
     if (xhci_wait_cmd(hc, trb, NULL) != 0) {
-        hc->slots[d->slot] = NULL;
-        hc->dcbaa[d->slot] = 0;
-        kfree(d);
+        xhci_dev_release(hc, d);
         return -1;
     }
 
@@ -536,7 +580,13 @@ static int xhci_intr_open(usb_controller_t *c, usb_device_t *dev,
 
     u64 irq_phys = usb_dma_alloc(1);
     u64 buf_phys = usb_dma_alloc(1);
-    if (!irq_phys || !buf_phys) return -1;
+    if (!irq_phys || !buf_phys) {
+        /* The two pages are allocated separately; free whichever one was
+         * obtained instead of dropping it on the floor. */
+        usb_dma_free(irq_phys, 1);
+        usb_dma_free(buf_phys, 1);
+        return -1;
+    }
 
     ring_init(hc, &d->irq, irq_phys, XHCI_RING_TRBS);
     d->irq_buf = phys_to_virt(buf_phys);
@@ -569,7 +619,17 @@ static int xhci_intr_open(usb_controller_t *c, usb_device_t *dev,
     u64 trb = 0;
     xhci_ring_cmd(hc, d->in_ctx_phys, 0,
                   TRB_TYPE(TRB_CONFIG_EP) | TRB_SLOT(d->slot), &trb);
-    if (xhci_wait_cmd(hc, trb, NULL) != 0) return -1;
+    if (xhci_wait_cmd(hc, trb, NULL) != 0) {
+        /* CONFIG_EP failed: hand the pages back here and clear the fields so
+         * the dev_close() that follows does not free them a second time. The
+         * slot itself is disabled by xhci_dev_release(). */
+        d->irq.phys = 0;
+        d->irq_buf_phys = 0;
+        d->irq_buf = NULL;
+        usb_dma_free(irq_phys, 1);
+        usb_dma_free(buf_phys, 1);
+        return -1;
+    }
 
     d->irq_len = maxp ? maxp : 8;
     d->armed = 1;
@@ -608,6 +668,7 @@ static const usb_hcd_ops_t g_xhci_ops = {
     .port_count = xhci_port_count,
     .port_connected = xhci_port_connected,
     .dev_open = xhci_dev_open,
+    .dev_close = xhci_dev_close,
     .set_address = xhci_set_address,
     .control = xhci_control,
     .intr_open = xhci_intr_open,

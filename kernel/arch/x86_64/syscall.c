@@ -352,6 +352,20 @@ static long sys_read(int fd, u64 ubuf, u64 len) {
     return -EBADF;
 }
 
+static long sys_write_nb(int fd, u64 ubuf, u64 len) {
+    /* Pipe-only: file and console writes never block for long, and the desktop
+     * is the only caller. The buffer is small because this is used for fixed
+     * GUI event records, not bulk data. */
+    if (len > 512) return -EINVAL;
+
+    task_t *t = current_task();
+    if (!t || fd < 0 || fd >= VFS_MAX_FDS || !t->pipes[fd]) return -EBADF;
+
+    char buf[512];
+    if (copy_from_user(buf, (const void *)(uptr)ubuf, len) != 0) return -EFAULT;
+    return pipe_write_nb(t->pipes[fd], buf, len);
+}
+
 static long sys_write(int fd, u64 ubuf, u64 len) {
     if (len > USER_IO_MAX) return -EINVAL;
 
@@ -1308,6 +1322,9 @@ void syscall_handler(syscall_frame_t *f) {
         break;
     case SYS_USBINFO:
         ret = sys_usbinfo(f->rdi);
+        break;
+    case SYS_WRITE_NB:
+        ret = sys_write_nb((int)f->rdi, f->rsi, f->rdx);
         break;
     case SYS_AI_CONNECT:
         ret = sys_ai_connect(f->rdi);

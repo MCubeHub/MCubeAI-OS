@@ -114,6 +114,25 @@ long pipe_write(pipe_end_t *e, const void *buf, u64 len) {
     return (long)done;
 }
 
+/* All-or-nothing write that never sleeps. Callers that must not stall (the
+ * desktop compositor sending input to a window) use this and drop the event
+ * when the ring has no room; a partial write would split a fixed-size record. */
+long pipe_write_nb(pipe_end_t *e, const void *buf, u64 len) {
+    if (!e || !e->write) return -EBADF;
+    if (len == 0) return 0;
+
+    pipe_buf_t *p = e->buf;
+    if (p->readers == 0) return -EPIPE;
+    if (len > (u64)(PIPE_BUF_SIZE - p->count)) return -EAGAIN;
+
+    for (u64 i = 0; i < len; i++) {
+        p->buf[p->tail] = ((const u8 *)buf)[i];
+        p->tail = (p->tail + 1) % PIPE_BUF_SIZE;
+        p->count++;
+    }
+    return (long)len;
+}
+
 int pipe_readable(pipe_end_t *e) {
     if (!e || e->write) return 0;
     pipe_buf_t *p = e->buf;

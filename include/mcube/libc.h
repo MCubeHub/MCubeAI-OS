@@ -34,6 +34,8 @@ int   open(const char *path, int flags, ...);
 int   close(int fd);
 ssize_t read(int fd, void *buf, size_t len);
 ssize_t write(int fd, const void *buf, size_t len);
+/* Non-blocking write for pipe fds. Returns -EAGAIN when the pipe is full. */
+ssize_t write_nb(int fd, const void *buf, size_t len);
 int   stat(const char *path, mcube_stat_t *st);
 int   fstat(int fd, mcube_stat_t *st);
 int   mkdir(const char *path, int mode);
