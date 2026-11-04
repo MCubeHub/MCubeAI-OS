@@ -41,6 +41,8 @@
 #define THUMB_COLS    8            /* atlas columns */
 #define THUMB_MAX     32           /* atlas slots (8 x 4) */
 #define THUMB_MAX_BYTES (1024 * 1024)
+#define ATLAS_W       (THUMB_COLS * THUMB_W)
+#define ATLAS_H       ((THUMB_MAX / THUMB_COLS) * THUMB_H)
 
 #define C_BG        0x1B1F27
 #define C_TOOLBAR   0x22262F
@@ -96,6 +98,8 @@ static u8 *g_trows;
 static u32 *g_tnat;
 static u32 *g_tsmall;
 static int g_tbuf_state;      /* 0 not tried, 1 ready, 2 allocation failed */
+static u32 *g_tatlas;         /* fixed-size atlas sent once before first PUT */
+static int g_tatlas_ready;
 
 /* Address bar editing. Clicking the bar starts editing; Enter navigates. */
 static int  g_addr_edit;
@@ -277,6 +281,8 @@ static int thumb_buffers(void) {
 /* Decode entry `idx` and place it in its atlas slot. Returns 1 when the
  * thumbnail is ready, 0 otherwise; failures are latched so a broken file is
  * not decoded again on every repaint. */
+static int atlas_prepare(void);
+
 static int thumb_build(int idx) {
     int slot = thumb_slot(idx);
     if (thumb_ready(idx)) return 1;
@@ -285,6 +291,7 @@ static int thumb_build(int idx) {
     g_tslot_idx[slot] = idx;
     g_tslot_state[slot] = 2;          /* assume failure until proven otherwise */
     if (!thumb_buffers()) return 0;
+    if (!atlas_prepare()) return 0;
 
     char full[384];
     join_path(full, sizeof(full), g_cwd, g_entries[idx].name);
@@ -377,8 +384,32 @@ static int thumb_pump(void) {
     return pending;
 }
 
+/* Publish the full atlas once before any rectangle is written. Sub-rectangle
+ * uploads can grow a desktop slot, and a growing slot has to shift its rows to
+ * a wider stride; doing that while thumbnails are already cached makes the
+ * earlier tiles read back at the wrong stride. A fixed-size atlas keeps the
+ * stride constant, so every gui_image_put/gui_image_blit uses the same width. */
+static int atlas_prepare(void) {
+    if (g_tatlas_ready == 1) return 1;
+    if (g_tatlas_ready == 2) return 0;
+
+    if (!g_tatlas) g_tatlas = malloc((size_t)ATLAS_W * ATLAS_H * 4u);
+    if (!g_tatlas) {
+        g_tatlas_ready = 2;
+        return 0;
+    }
+    for (int i = 0; i < ATLAS_W * ATLAS_H; i++) g_tatlas[i] = 0x10161E;
+    if (gui_image_load(0, ATLAS_W, ATLAS_H, g_tatlas) != 0) {
+        g_tatlas_ready = 2;
+        return 0;
+    }
+    g_tatlas_ready = 1;
+    return 1;
+}
+
 static void toggle_view(void) {
     g_view = g_view ? 0 : 1;
+    if (g_view) atlas_prepare();
     g_top = 0;
     if (g_sel >= 0) g_top = g_sel;
     g_need = 1;

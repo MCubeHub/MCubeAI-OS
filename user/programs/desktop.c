@@ -3570,17 +3570,19 @@ static void handle_cmd(int slot, const gui_cmd_t *cmd) {
         if (rx < 0 || ry < 0) break;
         if (cmd->len < (u32)((u64)cmd->w * (u64)cmd->h * 4u)) break;
 
-        int nw = rx + cmd->w;
-        int nh = ry + cmd->h;
+        win_img_t *im = &w->imgs[id];
+        int need_w = rx + cmd->w;
+        int need_h = ry + cmd->h;
+        int nw = im->w > need_w ? im->w : need_w;
+        int nh = im->h > need_h ? im->h : need_h;
         if ((u64)nw * (u64)nh > (u64)GUI_IMG_MAX_PX) break;
 
-        win_img_t *im = &w->imgs[id];
         if (!im->px) im->px = (u32 *)malloc((size_t)GUI_IMG_MAX_PX * 4u);
         if (!im->px) break;
 
-        /* Widen the slot first if needed; existing rows must shift right by the
-         * difference, and the source rows are copied bottom-up to avoid
-         * overwriting data that has not moved yet. */
+        /* Only grow: a rectangle that starts left of the current width must not
+         * reset im->w, or rows written earlier would be read back at a narrower
+         * stride and appear sheared. */
         if (nw > im->w && im->used) {
             for (int y = im->h - 1; y >= 0; y--) {
                 memmove(im->px + (u64)y * (u64)nw,
