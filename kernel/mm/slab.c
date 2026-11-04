@@ -16,6 +16,12 @@
 #define SLAB_SIZES  { 16, 32, 64, 128, 256, 512, 1024, 2048 }
 #define LARGE_THRESHOLD 2048
 
+/* One bit per object marks "currently allocated". kfree() uses it to reject a
+ * pointer that is not an object start and to catch a double free before the
+ * object is linked a second time. ~250 objects is the worst case (16-byte
+ * objects in a 4 KiB page), so 32 bytes covers every cache. */
+#define SLAB_MAP_BYTES 32
+
 struct slab_hdr {
     u32 magic;
     u16 obj_size;
@@ -26,6 +32,7 @@ struct slab_hdr {
     struct slab_hdr *next;
     struct kmem_cache *cache;
     u64 reserved;
+    u8 alloc_map[SLAB_MAP_BYTES];
 };
 
 struct large_hdr {
@@ -53,6 +60,18 @@ static usize object_offset(void) {
     return (off + 15) & ~(usize)15;
 }
 
+static void slab_map_set(struct slab_hdr *h, usize idx) {
+    h->alloc_map[idx / 8] |= (u8)(1u << (idx % 8));
+}
+
+static void slab_map_clear(struct slab_hdr *h, usize idx) {
+    h->alloc_map[idx / 8] &= (u8)~(1u << (idx % 8));
+}
+
+static int slab_map_test(struct slab_hdr *h, usize idx) {
+    return (h->alloc_map[idx / 8] >> (idx % 8)) & 1;
+}
+
 static struct slab_hdr *slab_create(struct kmem_cache *c) {
     u64 va = vmm_arena_alloc(1);
     if (!va) return NULL;
@@ -60,6 +79,7 @@ static struct slab_hdr *slab_create(struct kmem_cache *c) {
     struct slab_hdr *h = (struct slab_hdr *)(uptr)va;
     usize off = object_offset();
     usize cap = (PAGE_SIZE - off) / c->size;
+    if (cap > SLAB_MAP_BYTES * 8) cap = SLAB_MAP_BYTES * 8;
     if (cap == 0) {
         vmm_arena_free(va, 1);
         return NULL;
@@ -72,6 +92,7 @@ static struct slab_hdr *slab_create(struct kmem_cache *c) {
     h->offset = (u16)off;
     h->cache = c;
     h->next = NULL;
+    memset(h->alloc_map, 0, sizeof(h->alloc_map));
 
     u8 *obj = (u8 *)va + off;
     h->free = obj;
@@ -106,6 +127,7 @@ static void *slab_alloc(struct kmem_cache *c) {
     h->free = *(void **)obj;
     h->inuse++;
     c->allocated_objects++;
+    slab_map_set(h, ((u64)(uptr)obj - ((u64)(uptr)h + h->offset)) / h->obj_size);
     if (!h->free) {
         partial_unlink(c, h);
     }
@@ -114,6 +136,16 @@ static void *slab_alloc(struct kmem_cache *c) {
 
 static void slab_free(struct slab_hdr *h, void *ptr) {
     struct kmem_cache *c = h->cache;
+    usize idx = ((u64)(uptr)ptr - ((u64)(uptr)h + h->offset)) / h->obj_size;
+    int was_full = (h->inuse >= h->capacity);
+
+    /* The allocation map is the authoritative record: an object that is not
+     * marked allocated has either never been handed out from this base or is
+     * being freed twice. Linking it again would corrupt the free list, so stop
+     * here instead of limping on with a broken heap. */
+    if (!slab_map_test(h, idx)) panic("kfree: double free of %p", ptr);
+    slab_map_clear(h, idx);
+
     *(void **)ptr = h->free;
     h->free = ptr;
     if (h->inuse) h->inuse--;
@@ -123,6 +155,15 @@ static void slab_free(struct slab_hdr *h, void *ptr) {
         partial_unlink(c, h);
         h->magic = 0;
         vmm_arena_free((u64)(uptr)h, 1);
+        return;
+    }
+
+    /* A full slab is unlinked from c->partial by slab_alloc(). The first free
+     * puts it back to partially empty, so it must be re-linked or the slots it
+     * still owns are unreachable for the rest of the boot. */
+    if (was_full) {
+        h->next = c->partial;
+        c->partial = h;
     }
 }
 
@@ -219,6 +260,15 @@ void kfree(void *ptr) {
     struct slab_hdr *sh = (struct slab_hdr *)(uptr)base;
     if (sh->magic == SLAB_MAGIC) {
         if (sh->cache == NULL) panic("kfree: corrupted slab header at %p", (void *)base);
+        /* Reject interior/unowned pointers before touching any object word:
+         * slab_free() indexes the allocation map by object slot, so a bogus
+         * pointer would otherwise clear another object's bit and hide a leak. */
+        u64 first = base + sh->offset;
+        u64 last = first + (u64)sh->obj_size * (u64)sh->capacity;
+        if ((u64)(uptr)ptr < first || (u64)(uptr)ptr >= last ||
+            ((u64)(uptr)ptr - first) % sh->obj_size != 0) {
+            panic("kfree: %p is not a slab object start", ptr);
+        }
         g_used_bytes -= sh->obj_size;
         if (g_alloc_count) g_alloc_count--;
         slab_free(sh, ptr);

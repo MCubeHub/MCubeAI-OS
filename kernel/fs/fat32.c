@@ -285,6 +285,7 @@ static int dir_find(fat32_fs_t *fs, u32 dir_cluster, const char *want,
     u32 per_cluster = cb / DIRENT_SIZE;
     u32 slot = 0;
     u32 c = dir_cluster;
+    u32 guard = 0;
 
     while (c >= 2 && c < FAT32_EOC) {
         if (cluster_read(fs, c) != 0) return -EIO;
@@ -313,6 +314,9 @@ static int dir_find(fat32_fs_t *fs, u32 dir_cluster, const char *want,
             }
         }
         c = fat_get(fs, c);
+        /* A corrupt FAT can point a chain back at an earlier cluster. Cap the
+         * walk like fat_free_chain() does, otherwise the lookup spins forever. */
+        if (++guard > fs->total_clusters) return -EIO;
     }
     return -ENOENT;
 }
@@ -322,6 +326,7 @@ static int dir_is_empty(fat32_fs_t *fs, u32 dir_cluster) {
     u32 cb = cluster_bytes(fs);
     u32 per_cluster = cb / DIRENT_SIZE;
     u32 c = dir_cluster;
+    u32 guard = 0;
 
     while (c >= 2 && c < FAT32_EOC) {
         if (cluster_read(fs, c) != 0) return -EIO;
@@ -339,6 +344,9 @@ static int dir_is_empty(fat32_fs_t *fs, u32 dir_cluster) {
             return 0;
         }
         c = fat_get(fs, c);
+        /* Same bound as dir_find(): report a looping chain as an I/O error
+         * rather than pretending an unreachable directory is empty. */
+        if (++guard > fs->total_clusters) return -EIO;
     }
     return 1;
 }
