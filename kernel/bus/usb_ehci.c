@@ -268,7 +268,12 @@ static int ehci_intr_open(usb_controller_t *c, usb_device_t *dev,
     memset(page, 0, 4096);
 
     ehci_dev_t *ud = kzalloc(sizeof(*ud));
-    if (!ud) return -1;
+    if (!ud) {
+        /* The QH/TD page is already allocated; return it instead of leaking
+         * one page each time a failed device is retried. */
+        usb_dma_free(phys, 1);
+        return -1;
+    }
 
     ehci_ep_t *ep = &ud->ep;
     ep->qh = (volatile u32 *)page;

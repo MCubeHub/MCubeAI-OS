@@ -249,6 +249,9 @@ static int uhci_intr_open(usb_controller_t *c, usb_device_t *dev,
     u8 *page = uhci_page(&phys);
     uhci_dev_t *ud = kzalloc(sizeof(*ud));
     if (!page || !ud) {
+        /* Free whichever half succeeded: page is NULL when the DMA alloc
+         * failed, ud is NULL when the struct alloc failed. */
+        if (page) usb_dma_free(phys, 1);
         kfree(ud);
         return -1;
     }
