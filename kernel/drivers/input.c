@@ -74,6 +74,31 @@ void input_push_mouse(i32 dx, i32 dy, u32 buttons) {
     queue_push(&ev);
 }
 
+/* USB tablets and touch digitizers report the pointer position outright, so
+ * overwrite the accumulated position instead of adding a delta. The desktop
+ * only reads ev.x/ev.y, so no display code has to change. */
+void input_push_abs(i32 x, i32 y, u32 buttons) {
+    i32 maxx = g_mouse_w > 1 ? g_mouse_w - 1 : 0;
+    i32 maxy = g_mouse_h > 1 ? g_mouse_h - 1 : 0;
+    i32 nx = clamp_i32(x, 0, maxx);
+    i32 ny = clamp_i32(y, 0, maxy);
+
+    input_event_t ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.type = INPUT_MOUSE;
+    ev.code = buttons;
+    ev.x = nx;
+    ev.y = ny;
+    ev.dx = nx - g_mouse_x;
+    ev.dy = ny - g_mouse_y;
+    ev.buttons = buttons;
+
+    g_mouse_x = nx;
+    g_mouse_y = ny;
+    g_buttons = buttons;
+    queue_push(&ev);
+}
+
 int input_pop(input_event_t *out) {
     if (!out) return 0;
     u64 flags = spin_lock_irqsave(&g_lock);

@@ -162,6 +162,72 @@ void gui_kill(int pid) {
     send_cmd(&cmd);
 }
 
+/* Upload a bitmap into a desktop cache slot: the fixed-size header is followed
+ * by the raw pixel payload, which the desktop reads right after the header. */
+int gui_image_load(int slot, int w, int h, const u32 *rgb) {
+    if (!g_ok || !rgb || w <= 0 || h <= 0) return -1;
+    if ((u64)w * (u64)h > (u64)GUI_IMG_MAX_PX) return -1;
+
+    gui_cmd_t cmd;
+    init_cmd(&cmd, GUI_CMD_IMAGE);
+    cmd.x = slot;
+    cmd.w = w;
+    cmd.h = h;
+    cmd.len = (u32)((u64)w * (u64)h * 4u);
+
+    if (send_cmd(&cmd) != 0) return -1;
+    if (write_all(GUI_CMD_FD, rgb, (size_t)cmd.len) != 0) {
+        g_ok = 0;
+        return -1;
+    }
+    return 0;
+}
+
+void gui_image_draw(int slot, int x, int y, int src_y, int rows) {
+    gui_cmd_t cmd;
+    init_cmd(&cmd, GUI_CMD_IMAGE_DRAW);
+    cmd.x = x;
+    cmd.y = y;
+    cmd.w = slot;
+    cmd.h = src_y;
+    cmd.flags = (u32)(rows > 0 ? rows : 0);
+    send_cmd(&cmd);
+}
+
+int gui_image_put(int slot, int x, int y, int w, int h, const u32 *rgb) {
+    if (!g_ok || !rgb || x < 0 || y < 0 || w <= 0 || h <= 0) return -1;
+    if ((u64)(x + w) * (u64)(y + h) > (u64)GUI_IMG_MAX_PX) return -1;
+
+    gui_cmd_t cmd;
+    init_cmd(&cmd, GUI_CMD_IMAGE_PUT);
+    cmd.x = slot;
+    cmd.y = y;
+    cmd.w = w;
+    cmd.h = h;
+    cmd.color = (u32)x;
+    cmd.len = (u32)((u64)w * (u64)h * 4u);
+
+    if (send_cmd(&cmd) != 0) return -1;
+    if (write_all(GUI_CMD_FD, rgb, (size_t)cmd.len) != 0) {
+        g_ok = 0;
+        return -1;
+    }
+    return 0;
+}
+
+void gui_image_blit(int slot, int x, int y, int sx, int sy, int w, int h) {
+    gui_cmd_t cmd;
+    init_cmd(&cmd, GUI_CMD_IMAGE_BLIT);
+    cmd.x = x;
+    cmd.y = y;
+    cmd.w = slot;
+    cmd.h = sy;
+    cmd.color = (u32)sx;
+    cmd.len = (u32)(w > 0 ? w : 0);
+    cmd.flags = (u32)(h > 0 ? h : 0);
+    send_cmd(&cmd);
+}
+
 int gui_wait(gui_event_t *ev, int timeout_ms) {
     if (!g_ok) return -1;
 

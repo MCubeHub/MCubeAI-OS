@@ -81,7 +81,7 @@ AI_TOOLS_O := $(patsubst %.c,$(BUILD)/%.o,$(AI_TOOLS_C))
 USER_PROGS      := sh ls cat echo mkdir rm cp mv pwd sleep wc grep head tail \
                    uname true false clear env help lgyconv \
                    desktop terminal files editor calc image settings taskman \
-                   sysinfo aiosd ai
+                   sysinfo browser slides aiosd ai
 USER_PROG_OBJS  := $(addprefix $(BUILD)/user/bin/,$(addsuffix .o,$(USER_PROGS)))
 USER_PROG_ELFS  := $(addprefix $(BUILD)/user/bin/,$(addsuffix .elf,$(USER_PROGS)))
 USER_PROG_LGYS  := $(addprefix $(BUILD)/user/bin/,$(addsuffix .lgy,$(USER_PROGS)))
@@ -94,6 +94,10 @@ ESP_IMG         := $(BUILD)/esp.img
 INITRD_IMG      := $(BUILD)/initrd.img
 KERNEL_ELF      := $(BUILD)/kernel.elf
 BOOT_EFI        := $(BUILD)/BOOTX64.EFI
+STAGE1_BIN      := $(BUILD)/stage1.bin
+STAGE2_BIN      := $(BUILD)/stage2.bin
+BIOS_PAYLOAD    := $(BUILD)/bios-payload.bin
+MBR_BIN         := $(STAGE1_BIN)
 SERIAL_LOG      := $(BUILD)/serial.log
 
 DIST_NAME       := MCubeAIOS-$(VERSION)
@@ -164,13 +168,27 @@ $(BUILD)/tiny.gguf: tools/gen_tiny_model.py
 	python3 tools/gen_tiny_model.py $@
 	@echo "  MODEL   $@"
 
+# Sample bitmaps for the Pictures album. They are tiny (320x200) but cover all
+# three decoders: PNG, BMP and PPM.
+PICTURES_DIR    := $(BUILD)/pictures
+PICTURE_STAMP   := $(PICTURES_DIR)/.stamp
+PICTURE_NAMES   := SUNSET.PNG RINGS.BMP SHADE.PPM
+PICTURE_FILES   := $(addprefix $(PICTURES_DIR)/,$(PICTURE_NAMES))
+
+$(PICTURE_STAMP): tools/gen_samples.py
+	@mkdir -p $(PICTURES_DIR)
+	python3 tools/gen_samples.py $(PICTURES_DIR)
+	@touch $@
+
 # Live root filesystem: the loader reads this with firmware services only, so
 # USB sticks and CD/DVD boots work without a kernel storage driver.
-$(INITRD_IMG): $(KERNEL_ELF) $(USER_PROG_LGYS) $(BUILD)/tiny.gguf tools/mkinitrd.py
+$(INITRD_IMG): $(KERNEL_ELF) $(USER_PROG_LGYS) $(BUILD)/tiny.gguf \
+               $(PICTURE_STAMP) tools/mkinitrd.py
 	@mkdir -p $(dir $@)
 	python3 tools/mkinitrd.py $@ --kernel $(KERNEL_ELF) \
 	    --model $(BUILD)/tiny.gguf \
-	    $(foreach p,$(USER_PROGS),--prog $(BUILD)/user/bin/$(p).lgy)
+	    $(foreach p,$(USER_PROGS),--prog $(BUILD)/user/bin/$(p).lgy) \
+	    $(foreach p,$(PICTURE_FILES),--asset $(p))
 
 $(USER_ELF): $(USER_OBJ) $(USER_LIB_OBJS) user/user.ld
 	@mkdir -p $(dir $@)
@@ -214,12 +232,13 @@ $(BOOT_EFI): boot/loader.c boot/efi.h include/mcube/bootinfo.h include/mcube/typ
 	$(MINGW) $(BOOT_CFLAGS) $(BOOT_LDFLAGS) -o $@ boot/loader.c
 	@echo "  EFI     $@"
 
-$(ESP_IMG): $(KERNEL_ELF) $(BOOT_EFI) $(USER_PROG_LGYS) $(BUILD)/tiny.gguf $(INITRD_IMG)
+$(ESP_IMG): $(KERNEL_ELF) $(BOOT_EFI) $(USER_PROG_LGYS) $(BUILD)/tiny.gguf \
+            $(INITRD_IMG) $(PICTURE_STAMP)
 	@mkdir -p $(dir $@)
 	rm -f $@
 	dd if=/dev/zero of=$@ bs=1M count=64 status=none
 	mformat -i $@ -F ::
-	mmd -i $@ ::/EFI ::/EFI/BOOT ::/BIN ::/MODELS
+	mmd -i $@ ::/EFI ::/EFI/BOOT ::/BIN ::/MODELS ::/PICTURES
 	mcopy -i $@ $(BOOT_EFI) ::/EFI/BOOT/BOOTX64.EFI
 	mcopy -i $@ $(KERNEL_ELF) ::/kernel.elf
 	# The FAT32 driver does not parse LFN entries yet, so the model must use
@@ -229,20 +248,54 @@ $(ESP_IMG): $(KERNEL_ELF) $(BOOT_EFI) $(USER_PROG_LGYS) $(BUILD)/tiny.gguf $(INI
 	@for p in $(USER_PROGS); do \
 	  mcopy -i $@ $(BUILD)/user/bin/$$p.lgy ::/BIN/`echo $$p | tr 'a-z' 'A-Z'`.LGY || exit 1; \
 	done
+	@for p in $(PICTURE_NAMES); do \
+	  mcopy -i $@ $(PICTURES_DIR)/$$p ::/PICTURES/$$p || exit 1; \
+	done
 	@echo "  IMG     $@"
 
-# UEFI El Torito ISO. The FAT32 ESP image doubles as the boot image, and the
-# GPT/basdat hybrid layout makes the ISO writable to a USB stick as well.
-$(ISO_IMG): $(ESP_IMG) $(KERNEL_ELF) $(BOOT_EFI)
+# Legacy BIOS boot chain. stage1 is the 432-byte MBR; it finds the payload
+# partition by its "MCBB" header magic and loads stage2, which then does the
+# A20/E820/VBE work and enters long mode. The same payload is used by the ISO
+# (as an appended 0x83 partition) and by the disk images.
+$(STAGE1_BIN): boot/bios/stage1.asm
+	@mkdir -p $(dir $@)
+	nasm -f bin -o $@ $<
+	@echo "  MBR     $@"
+
+$(STAGE2_BIN): boot/bios/stage2.asm
+	@mkdir -p $(dir $@)
+	nasm -f bin -o $@ $<
+	@echo "  MBR     $@"
+
+$(BIOS_PAYLOAD): $(KERNEL_ELF) $(INITRD_IMG) $(STAGE2_BIN) tools/mkbios.py
+	@mkdir -p $(dir $@)
+	python3 tools/mkbios.py -o $@ --kernel $(KERNEL_ELF) \
+	    --initrd $(INITRD_IMG) --stage2 $(STAGE2_BIN)
+
+# UEFI El Torito ISO. The FAT32 ESP image doubles as the El Torito boot image,
+# and -append_partition adds it a second time as an MBR partition of type 0xEF
+# so firmware finds an EFI System Partition after the ISO has been written to a
+# USB stick (Rufus ISO/DD mode, dd) instead of only from a CD/DVD drive.
+# Partition 3 carries the BIOS payload, and -isohybrid-mbr installs
+# boot/bios/stage1.asm as the MBR boot code, so the same ISO also boots on
+# legacy BIOS.
+$(ISO_IMG): $(ESP_IMG) $(KERNEL_ELF) $(BOOT_EFI) $(BIOS_PAYLOAD) Makefile
 	@mkdir -p $(dir $@)
 	rm -rf $(ISO_ROOT)
-	mkdir -p $(ISO_ROOT)
+	mkdir -p $(ISO_ROOT)/EFI/BOOT
 	cp $(ESP_IMG) $(ISO_ROOT)/ESP.IMG
 	cp $(KERNEL_ELF) $(ISO_ROOT)/KERNEL.ELF
 	cp $(BOOT_EFI) $(ISO_ROOT)/BOOTX64.EFI
+	# Also expose the loader at the UEFI fallback path so tools that extract
+	# the ISO onto a FAT32 stick (Rufus "ISO image" mode) still find it.
+	cp $(BOOT_EFI) $(ISO_ROOT)/EFI/BOOT/BOOTX64.EFI
 	printf 'MCubeAIOS %s\n' '$(VERSION)' > $(ISO_ROOT)/VERSION.TXT
 	xorriso -as mkisofs -R -J -V 'MCUBEAIOS' -A 'MCubeAIOS $(VERSION)' \
-	    -e ESP.IMG -no-emul-boot -isohybrid-gpt-basdat \
+	    -e ESP.IMG -no-emul-boot -eltorito-platform efi \
+	    -append_partition 2 0xef $(ISO_ROOT)/ESP.IMG \
+	    -append_partition 3 0x83 $(BIOS_PAYLOAD) \
+	    -isohybrid-mbr $(STAGE1_BIN) \
+	    -isohybrid-gpt-basdat \
 	    -o $@ $(ISO_ROOT)
 	@echo "  ISO     $@"
 
@@ -250,9 +303,10 @@ iso: $(ISO_IMG)
 
 # Hybrid hard-disk / USB image: MBR + EFI system partition at LBA 2048.
 # dd it to a USB stick (or use Rufus DD mode), or attach it as a disk.
-$(DISK_IMG): $(ESP_IMG) tools/mkdisk.py
+$(DISK_IMG): $(ESP_IMG) $(MBR_BIN) $(BIOS_PAYLOAD) tools/mkdisk.py
 	@mkdir -p $(dir $@)
-	python3 tools/mkdisk.py $@ $(ESP_IMG)
+	python3 tools/mkdisk.py --mbr-code $(MBR_BIN) \
+	    --bios-payload $(BIOS_PAYLOAD) $@ $(ESP_IMG)
 	@echo "  DISK    $@"
 
 usb: $(DISK_IMG)
@@ -261,9 +315,10 @@ usb: $(DISK_IMG)
 # whose firmware prefers GPT disks and for users who repartition later.
 DISK_GPT_IMG := $(BUILD)/disk-gpt.img
 
-$(DISK_GPT_IMG): $(ESP_IMG) tools/mkdisk.py
+$(DISK_GPT_IMG): $(ESP_IMG) $(MBR_BIN) $(BIOS_PAYLOAD) tools/mkdisk.py
 	@mkdir -p $(dir $@)
-	python3 tools/mkdisk.py --gpt $@ $(ESP_IMG)
+	python3 tools/mkdisk.py --gpt --mbr-code $(MBR_BIN) \
+	    --bios-payload $(BIOS_PAYLOAD) $@ $(ESP_IMG)
 	@echo "  DISK    $@"
 
 disk-gpt: $(DISK_GPT_IMG)
@@ -309,11 +364,11 @@ package: $(ESP_IMG) $(KERNEL_ELF) $(BOOT_EFI) $(USER_PROG_LGYS) \
 	cp $(INITRD_IMG) $(PACKAGE_DIR)/initrd.img
 	cp $(USER_PROG_LGYS) $(PACKAGE_DIR)/bin/
 	@printf '%s\n' \
-	    'MCubeAIOS $(VERSION) (x86_64 UEFI)' \
+	    'MCubeAIOS $(VERSION) (x86_64 UEFI + BIOS)' \
 	    '' \
 	    'Contents:' \
-	    '  $(DIST_NAME).iso        Bootable UEFI ISO (El Torito; dd-able to USB)' \
-	    '  $(DIST_NAME)-disk.img   MBR disk image with EFI partition (hard disk)' \
+	    '  $(DIST_NAME).iso        Bootable ISO (UEFI El Torito + BIOS isohybrid MBR)' \
+	    '  $(DIST_NAME)-disk.img   MBR disk image, dual boot (UEFI + BIOS)' \
 	    '  $(DIST_NAME)-usb.img    Same image for USB sticks (dd / Rufus DD mode)' \
 	    '  $(DIST_NAME)-esp.img    Raw FAT32 EFI system partition (64 MiB)' \
 	    '  $(DIST_NAME).vhd        Disk image converted to VHD' \
@@ -330,11 +385,16 @@ package: $(ESP_IMG) $(KERNEL_ELF) $(BOOT_EFI) $(USER_PROG_LGYS) \
 	    '    -drive if=pflash,format=raw,file=OVMF_VARS_4M.fd \' \
 	    '    -cdrom $(DIST_NAME).iso -serial stdio' \
 	    '' \
-	    'Boot the hard-disk image:' \
+	    'Boot the hard-disk image (UEFI):' \
 	    '  qemu-system-x86_64 -m 512M \' \
 	    '    -drive if=pflash,format=raw,readonly=on,file=OVMF_CODE_4M.fd \' \
 	    '    -drive if=pflash,format=raw,file=OVMF_VARS_4M.fd \' \
 	    '    -drive file=$(DIST_NAME)-disk.img,format=raw,if=ide -serial stdio' \
+	    '' \
+	    'Boot the same images on legacy BIOS (no pflash needed):' \
+	    '  qemu-system-x86_64 -m 512M \' \
+	    '    -drive file=$(DIST_NAME)-disk.img,format=raw,if=ide -serial stdio' \
+	    '  qemu-system-x86_64 -m 512M -cdrom $(DIST_NAME).iso -serial stdio' \
 	    '' \
 	    'Write the USB image (Linux):' \
 	    '  sudo dd if=$(DIST_NAME)-usb.img of=/dev/sdX bs=4M status=progress' \

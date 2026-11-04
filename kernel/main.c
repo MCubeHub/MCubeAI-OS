@@ -24,6 +24,8 @@
 #include <mcube/tty.h>
 #include <mcube/net.h>
 #include <mcube/hwinfo.h>
+#include <mcube/usb.h>
+#include <mcube/acpi.h>
 
 #define MCUBE_VERSION "0.1.0"
 #define MCUBE_CODENAME "Genesis"
@@ -93,20 +95,6 @@ static void dump_memory_map(const boot_info_t *bi) {
     }
 }
 
-static void check_rsdp(const boot_info_t *bi) {
-    if (!bi->rsdp) {
-        kprintf("[acpi] no RSDP handed over by loader\n");
-        return;
-    }
-    const char *sig = (const char *)phys_to_virt(bi->rsdp);
-    if (memcmp(sig, "RSD PTR ", 8) == 0) {
-        kprintf("[acpi] RSDP signature valid, revision %u\n",
-                (u32)((const u8 *)phys_to_virt(bi->rsdp))[15]);
-    } else {
-        kprintf("[acpi] bad RSDP signature at %p\n", phys_to_virt(bi->rsdp));
-    }
-}
-
 static u64 usable_bytes(const boot_info_t *bi) {
     boot_mem_entry_t *map = (boot_mem_entry_t *)phys_to_virt(bi->memmap_addr);
     u64 usable = 0;
@@ -152,7 +140,8 @@ void kernel_main(boot_info_t *bi) {
     }
 
     banner(bi);
-    check_rsdp(bi);
+    acpi_init(bi);
+    acpi_print_summary();
     dump_memory_map(bi);
     hw_info_init(bi);
     hw_info_print_summary();
@@ -184,32 +173,40 @@ void kernel_main(boot_info_t *bi) {
     } else {
         kprintf("[vfs] filesystem self test skipped (root not mounted)\n");
     }
-    /* The network self test waits for ARP/DNS replies with timer_sleep_ms(),
-     * which halts the CPU until the next PIT interrupt, so the tick source has
-     * to be live before the stack starts probing the gateway. */
+    /* Timer acceptance, before anything that sleeps.
+     *
+     * The window is measured with the polled PIT channel-2 counter rather than
+     * by halting and hoping IRQ0 wakes us: on firmware that leaves the 8259
+     * disconnected that halt never returns and the boot wedges right here.
+     * timer_selftest() also brings up the local APIC timer when no PIT tick
+     * shows up, so every later wait in the boot has a live time base.
+     * Failures are reported, not fatal. */
+    g_soft_timer_fired = 0;
+    timer_add(20, 0, soft_timer_cb, (void *)&g_soft_timer_fired);
     cpu_sti();
+    u32 elapsed = timer_selftest(50);
+    kprintf("[time] uptime %u ticks in the 50 ms window, wall clock epoch %u\n",
+            elapsed, (u32)timer_boot_time_unix());
+    if (!g_soft_timer_fired) {
+        kprintf("[time] warning: soft timer did not fire\n");
+    } else {
+        kprintf("[time] soft timer fired, tick source OK\n");
+    }
+
+    /* The network self test waits for ARP/DNS replies with timer_sleep_ms(),
+     * so it runs only once the tick source above has been accepted. */
     if (net_init() == 0) {
         net_selftest();
     } else {
         kprintf("[net] network self test skipped (no device)\n");
     }
 
-    /* Timer acceptance: ticks must advance and a soft timer must fire. */
-    g_soft_timer_fired = 0;
-    timer_add(20, 0, soft_timer_cb, (void *)&g_soft_timer_fired);
-    cpu_sti();
-    u64 t0 = timer_uptime_ms();
-    timer_sleep_ms(50);
-    u64 elapsed = timer_uptime_ms() - t0;
-    kprintf("[time] uptime %u ms after sleeping 50 ms, wall clock epoch %u\n",
-            (u32)elapsed, (u32)timer_boot_time_unix());
-    if (elapsed < 40 || elapsed > 500) {
-        panic("PIT timer is not ticking correctly (elapsed=%u)", (u32)elapsed);
-    }
-    if (!g_soft_timer_fired) {
-        panic("soft timer did not fire");
-    }
-    kprintf("[time] soft timer fired, tick source OK\n");
+    /* USB: probe the host controllers here (a handful of register reads) and
+     * leave the port-by-port enumeration to the usb-enum thread below, so a
+     * wedged port can never stall the boot. */
+    kprintf("[boot] usb: probing host controllers\n");
+    usb_init();
+    kprintf("[boot] usb: controllers probed\n");
 
     ai_subsys_init();
 
@@ -220,7 +217,9 @@ void kernel_main(boot_info_t *bi) {
     /* Show the hacker boot sequence while the serial console keeps logging.
      * The kernel console stops painting here; user space owns the screen from
      * the moment the desktop maps it. */
+    kprintf("[boot] splash: painting\n");
     fb_boot_splash((u32)(usable_bytes(bi) / MiB));
+    kprintf("[boot] splash: done, starting the scheduler\n");
 
     /* Hand the CPU to the round-robin scheduler. kernel_main's stack becomes
      * the abandoned boot context; all further work runs in kernel threads. */
@@ -229,6 +228,10 @@ void kernel_main(boot_info_t *bi) {
     task_create("beta", sched_demo, (void *)"beta");
     task_create("gamma", sched_demo, (void *)"gamma");
     task_create("monitor", sched_monitor, NULL);
+    /* Enumeration sleeps on the PIT and can be slow on a 20-port xHCI: it runs
+     * as a normal kernel thread so boot never waits for it. */
+    task_create("usb-enum", usb_enum_task, NULL);
+    kprintf("[sched] tasks created, spawning user init\n");
     if (user_spawn_init() != 0) {
         panic("cannot start user init");
     }

@@ -26,6 +26,7 @@ typedef struct PACKED mcube_fb_info {
 /* Kernel side (drivers/fb.c). */
 int  fb_get_info(mcube_fb_info_t *out);
 void fb_console_disable(void);
+void fb_console_enable(void);
 
 /* drivers/splash.c: hacker-style boot animation. Disables the text console
  * for the duration so the serial log keeps flowing without repainting. */

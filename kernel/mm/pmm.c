@@ -87,7 +87,12 @@ void pmm_init(const boot_info_t *bi) {
         }
     }
     if (!bmp_phys) {
+        /* Never place the bitmap in the first MiB: use_range(0, 1 MiB) below
+         * claims it for the loader, and the physical address 0 doubles as the
+         * "not found" sentinel. A BIOS E820 map does report usable RAM there,
+         * so this loop must skip it explicitly. */
         for (u32 i = 0; i < bi->memmap_count; i++) {
+            if (map[i].base < 1 * MiB) continue;
             if (range_usable(&map[i], g_bitmap_bytes)) {
                 bmp_phys = ALIGN_UP(map[i].base, PAGE_SIZE);
                 break;
@@ -118,6 +123,11 @@ void pmm_init(const boot_info_t *bi) {
      * firmware already marks them reserved, but the kernel image may be
      * reported as loader data on some firmware. */
     use_range(bi->kernel_base, bi->kernel_size);
+    /* The initrd lives in plain RAM above the kernel and is still being read
+     * by the VFS at run time, so it must never be handed out. The UEFI loader
+     * marks it reserved, but the BIOS chain only reports raw E820 data. */
+    if (bi->initrd_base && bi->initrd_size)
+        use_range(bi->initrd_base, bi->initrd_size);
     use_range(bi->loader_stack_top - 64 * KiB, 64 * KiB);
     use_range(bi->pml4_phys, 66 * PAGE_SIZE);
     use_range(bi->memmap_addr, (u64)bi->memmap_count * bi->memmap_desc_size);

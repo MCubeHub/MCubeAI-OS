@@ -25,6 +25,15 @@ static struct {
     int console_on;
 } g_fb;
 
+/* Shadow copy of the text screen. Scrolling used to memmove the framebuffer
+ * itself, which on a write-combined or uncached mapping means reading tens of
+ * megabytes back through the bus: the display then shows the copy creeping
+ * down the screen line by line. Shifting characters in RAM and repainting
+ * costs a few milliseconds and never reads the framebuffer at all. */
+#define GRID_COLS 512
+#define GRID_ROWS 160
+static char g_grid[GRID_ROWS][GRID_COLS];
+
 static u32 rgb_to_pixel(u8 r, u8 g, u8 b) {
     switch (g_fb.format) {
     case BOOT_PIXEL_BGRA8888:
@@ -48,14 +57,14 @@ static void fill_rect(u32 x, u32 y, u32 w, u32 h, u32 color) {
     }
 }
 
+static void repaint_screen(void);
+
 static void scroll_if_needed(void) {
     if (g_fb.cy < g_fb.rows) return;
-    u32 line_bytes = g_fb.pitch;
-    u64 scroll_bytes = (u64)FONT_H * line_bytes;
-    memmove(g_fb.base, g_fb.base + scroll_bytes,
-            (u64)g_fb.height * line_bytes - scroll_bytes);
-    fill_rect(0, (g_fb.rows - 1) * FONT_H, g_fb.width, FONT_H, g_fb.bg);
+    memmove(g_grid[0], g_grid[1], (size_t)(g_fb.rows - 1) * GRID_COLS);
+    for (u32 x = 0; x < GRID_COLS; x++) g_grid[g_fb.rows - 1][x] = ' ';
     g_fb.cy = g_fb.rows - 1;
+    repaint_screen();
 }
 
 void fb_init(const boot_info_t *bi) {
@@ -73,15 +82,21 @@ void fb_init(const boot_info_t *bi) {
     g_fb.bg = rgb_to_pixel(0x0B, 0x0D, 0x14);
     g_fb.cols = g_fb.width / FONT_W;
     g_fb.rows = g_fb.height / FONT_H;
+    if (g_fb.cols > GRID_COLS) g_fb.cols = GRID_COLS;
+    if (g_fb.rows > GRID_ROWS) g_fb.rows = GRID_ROWS;
     g_fb.cx = g_fb.cy = 0;
     g_fb.ready = 1;
     g_fb.console_on = 1;
+    for (u32 y = 0; y < GRID_ROWS; y++)
+        for (u32 x = 0; x < GRID_COLS; x++) g_grid[y][x] = ' ';
     fb_clear();
 }
 
 void fb_clear(void) {
     if (!g_fb.ready) return;
     fill_rect(0, 0, g_fb.width, g_fb.height, g_fb.bg);
+    for (u32 y = 0; y < g_fb.rows; y++)
+        for (u32 x = 0; x < g_fb.cols; x++) g_grid[y][x] = ' ';
     g_fb.cx = g_fb.cy = 0;
 }
 
@@ -94,6 +109,25 @@ static void draw_glyph(u32 cx, u32 cy, u8 ch) {
         for (u32 col = 0; col < FONT_W; col++) {
             u32 color = (bits & (0x80 >> col)) ? g_fb.fg : g_fb.bg;
             put_pixel(px + col, py + row, color);
+        }
+    }
+}
+
+static void put_glyph(u32 cx, u32 cy, u8 ch) {
+    if (cx >= g_fb.cols || cy >= g_fb.rows) return;
+    g_grid[cy][cx] = (char)ch;
+    draw_glyph(cx, cy, ch);
+}
+
+/* Redraw from the character grid only: no framebuffer reads, so this stays
+ * fast on write-combined mappings. */
+static void repaint_screen(void) {
+    if (!g_fb.ready) return;
+    fill_rect(0, 0, g_fb.width, g_fb.height, g_fb.bg);
+    for (u32 y = 0; y < g_fb.rows; y++) {
+        for (u32 x = 0; x < g_fb.cols; x++) {
+            char c = g_grid[y][x];
+            if (c > ' ' && (u8)c < 127) draw_glyph(x, y, (u8)c);
         }
     }
 }
@@ -117,14 +151,14 @@ void fb_putc(char c) {
     }
     case '\b':
         if (g_fb.cx > 0) g_fb.cx--;
-        draw_glyph(g_fb.cx, g_fb.cy, ' ');
+        put_glyph(g_fb.cx, g_fb.cy, ' ');
         return;
     default:
         break;
     }
 
     if ((u8)c < 32) return;
-    draw_glyph(g_fb.cx, g_fb.cy, (u8)c);
+    put_glyph(g_fb.cx, g_fb.cy, (u8)c);
     g_fb.cx++;
     if (g_fb.cx >= g_fb.cols) {
         g_fb.cx = 0;
@@ -164,4 +198,16 @@ int fb_get_info(mcube_fb_info_t *out) {
 
 void fb_console_disable(void) {
     g_fb.console_on = 0;
+}
+
+/* Re-arm the text console. The boot splash and the user-mode framebuffer
+ * both switch it off; the panic path turns it back on so a crash after the
+ * splash is still visible on screen instead of leaving a frozen last frame
+ * (which looks exactly like "boot stuck at 100%"). */
+void fb_console_enable(void) {
+    if (!g_fb.ready) return;
+    g_fb.console_on = 1;
+    fb_clear();
+    g_fb.cx = 0;
+    g_fb.cy = 0;
 }

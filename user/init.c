@@ -162,6 +162,52 @@ static int run_hw_test(void) {
     return 0;
 }
 
+/* BSD socket path: resolve a name through the gateway DNS server. */
+static void run_net_test(void) {
+    int sfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sfd >= 3) {
+        u8 query[32];
+        usize qlen = 0;
+        static const u8 hdr[12] = { 0x4D, 0x43, 0x01, 0x00, 0x00, 0x01,
+                                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+        for (int i = 0; i < 12; i++) query[qlen++] = hdr[i];
+        const char *name = "example.com";
+        while (*name) {
+            const char *dot = name;
+            while (*dot && *dot != '.') dot++;
+            query[qlen++] = (u8)(dot - name);
+            while (name < dot) query[qlen++] = (u8)*name++;
+            if (*dot == '.') name = dot + 1;
+        }
+        query[qlen++] = 0;
+        query[qlen++] = 0; query[qlen++] = 1;
+        query[qlen++] = 0; query[qlen++] = 1;
+
+        mcube_sockaddr_in_t sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sin_family = AF_INET;
+        sa.sin_port = (u16)((53 >> 8) | (53 << 8));
+        sa.sin_addr = 10u | (0u << 8) | (2u << 16) | (3u << 24);
+
+        int ok = 0;
+        if (sendto(sfd, query, qlen, 0, &sa, sizeof(sa)) == (long)qlen) {
+            u8 reply[256];
+            for (int tries = 0; tries < 100; tries++) {
+                mcube_sockaddr_in_t from;
+                u32 alen = sizeof(from);
+                long n = recvfrom(sfd, reply, sizeof(reply), 0, &from, &alen);
+                if (n > 12) {
+                    ok = (reply[0] == 0x4D && reply[1] == 0x43);
+                    break;
+                }
+                sleep_ms(5);
+            }
+        }
+        close(sfd);
+        printf(ok ? "USER_NET_OK\n" : "USER_NET_FAIL\n");
+    }
+}
+
 int main(int argc, char **argv, char **envp) {
     (void)argc; (void)argv; (void)envp;
 
@@ -209,50 +255,6 @@ int main(int argc, char **argv, char **envp) {
         close(tfd);
     }
 
-    /* BSD socket path: resolve a name through the gateway DNS server. */
-    int sfd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sfd >= 3) {
-        u8 query[32];
-        usize qlen = 0;
-        static const u8 hdr[12] = { 0x4D, 0x43, 0x01, 0x00, 0x00, 0x01,
-                                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
-        for (int i = 0; i < 12; i++) query[qlen++] = hdr[i];
-        const char *name = "example.com";
-        while (*name) {
-            const char *dot = name;
-            while (*dot && *dot != '.') dot++;
-            query[qlen++] = (u8)(dot - name);
-            while (name < dot) query[qlen++] = (u8)*name++;
-            if (*dot == '.') name = dot + 1;
-        }
-        query[qlen++] = 0;
-        query[qlen++] = 0; query[qlen++] = 1;
-        query[qlen++] = 0; query[qlen++] = 1;
-
-        mcube_sockaddr_in_t sa;
-        memset(&sa, 0, sizeof(sa));
-        sa.sin_family = AF_INET;
-        sa.sin_port = (u16)((53 >> 8) | (53 << 8));
-        sa.sin_addr = 10u | (0u << 8) | (2u << 16) | (3u << 24);
-
-        int ok = 0;
-        if (sendto(sfd, query, qlen, 0, &sa, sizeof(sa)) == (long)qlen) {
-            u8 reply[256];
-            for (int tries = 0; tries < 100; tries++) {
-                mcube_sockaddr_in_t from;
-                u32 alen = sizeof(from);
-                long n = recvfrom(sfd, reply, sizeof(reply), 0, &from, &alen);
-                if (n > 12) {
-                    ok = (reply[0] == 0x4D && reply[1] == 0x43);
-                    break;
-                }
-                sleep_ms(5);
-            }
-        }
-        close(sfd);
-        printf(ok ? "USER_NET_OK\n" : "USER_NET_FAIL\n");
-    }
-
     if (run_shell_test() == 0) printf("USER_SHELL_OK\n");
     if (run_redirect_test() == 0) printf("USER_REDIR_OK\n");
 
@@ -270,6 +272,15 @@ int main(int argc, char **argv, char **envp) {
         execv("/bin/desktop.lgy", desk_argv);
         printf("USER_DESKTOP_EXEC_FAIL\n");
         _exit(127);
+    }
+
+    /* The network self-check runs in its own process: the e1000 poll path can
+     * spin if the link never comes up, and it must never be able to keep the
+     * desktop (or the shell) off the screen. */
+    pid_t npid = fork();
+    if (npid == 0) {
+        run_net_test();
+        _exit(0);
     }
 
     /* Hand the console to an interactive shell. */

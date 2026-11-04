@@ -156,6 +156,41 @@ pid_t spawn(const char *path, char *const argv[], int cmd_fd, int evt_fd) {
                                   (long)fds, 0, 0));
 }
 
+void mc_power(int action) {
+    sys1(SYS_POWER, action);
+}
+
+int mc_dns_lookup(const char *name, u32 *ip_out) {
+    return fail(sys2(SYS_DNS, (long)name, (long)ip_out));
+}
+
+int net_info(mcube_net_info_t *info) {
+    long rc = sys1(SYS_NETINFO, (long)info);
+    if (rc < 0) {
+        errno = (int)-rc;
+        return -1;
+    }
+    return 0;
+}
+
+int battery_info(mcube_battery_info_t *info) {
+    long rc = sys1(SYS_BATTERY, (long)info);
+    if (rc < 0) {
+        errno = (int)-rc;
+        return -1;
+    }
+    return 0;
+}
+
+int usb_info(mcube_usb_info_t *info) {
+    long rc = sys1(SYS_USBINFO, (long)info);
+    if (rc < 0) {
+        errno = (int)-rc;
+        return -1;
+    }
+    return 0;
+}
+
 void *brk(void *addr) {
     long rc = sys1(SYS_BRK, (long)addr);
     if (rc < 0) {

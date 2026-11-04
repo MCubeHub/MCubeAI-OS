@@ -6,6 +6,7 @@
 #include <mcube/kernel.h>
 #include <mcube/io.h>
 #include <mcube/mm.h>
+#include <mcube/timer.h>
 
 #define IDT_ENTRIES 256
 #define IRQ_BASE 0x20
@@ -143,9 +144,18 @@ void isr_handler(isr_frame_t *f) {
         kprintf("\n!!! CPU exception %u: %s\n", (u32)f->vector, name);
         kprintf("    rip=%p cs=%x rflags=%p error=%p\n",
                 (void *)f->rip, (u32)f->cs, (void *)f->rflags, (void *)f->error);
-        kprintf("    rsp=%p rax=%p rbx=%p rcx=%p rdx=%p\n",
-                (void *)f->rsp, (void *)f->rax, (void *)f->rbx,
-                (void *)f->rcx, (void *)f->rdx);
+        /* rsp/ss only exist on the frame when the fault came from CPL3; a
+         * kernel-mode exception leaves them as stale stack contents, which
+         * used to look like a plausible (but wrong) stack pointer. */
+        if (f->cs & 3) {
+            kprintf("    rsp=%p rax=%p rbx=%p rcx=%p rdx=%p\n",
+                    (void *)f->rsp, (void *)f->rax, (void *)f->rbx,
+                    (void *)f->rcx, (void *)f->rdx);
+        } else {
+            kprintf("    rax=%p rbx=%p rcx=%p rdx=%p\n",
+                    (void *)f->rax, (void *)f->rbx,
+                    (void *)f->rcx, (void *)f->rdx);
+        }
         if (f->vector == 14) {
             u64 cr2 = read_cr2();
             kprintf("    page fault @ %p: %s%s%s%s%s\n", (void *)cr2,
@@ -165,9 +175,17 @@ void isr_handler(isr_frame_t *f) {
 
     if (f->vector >= IRQ_BASE && f->vector < IRQ_BASE + 16) {
         u32 irq = (u32)f->vector - IRQ_BASE;
-        /* EOI first: a handler may schedule away and not return for a while. */
-        if (irq >= 8) outb(0xA0, 0x20);
-        outb(0x20, 0x20);
+        /* EOI first: a handler may schedule away and not return for a while.
+         * When IRQ0 is delivered by the local APIC timer the interrupt never
+         * went through the 8259, so acknowledge the local APIC instead --
+         * a PIC EOI would leave the APIC in-service bit set and the tick
+         * would only ever fire once. */
+        if (irq == 0 && timer_uses_lapic()) {
+            timer_lapic_eoi();
+        } else {
+            if (irq >= 8) outb(0xA0, 0x20);
+            outb(0x20, 0x20);
+        }
         if (g_irq_handlers[irq].fn) {
             g_irq_handlers[irq].fn(f, g_irq_handlers[irq].ctx);
         }

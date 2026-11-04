@@ -29,6 +29,19 @@
 #define GUI_CMD_CLOSE   8
 #define GUI_CMD_LAUNCH  9
 #define GUI_CMD_KILL    10
+#define GUI_CMD_IMAGE   11   /* upload: x = slot, w/h = size, len = w*h*4; payload follows */
+#define GUI_CMD_IMAGE_DRAW 12 /* x,y = position, w = slot, h = source row, flags = rows */
+#define GUI_CMD_IMAGE_PUT 13 /* write a sub-rectangle: x = slot, y = dst row, w/h = region,
+                                color = dst column, len = w*h*4; payload follows */
+#define GUI_CMD_IMAGE_BLIT 14 /* paint a sub-rectangle: x,y = dest, w = slot, h = src row,
+                                 color = src column, len = src width, flags = src height */
+
+/* Bitmaps live in the desktop, one cache slot per window application. The app
+ * uploads pixel data once and then only sends a small "draw cached image" command
+ * each frame, so a full-window photo does not cost 1 MiB of pipe traffic per
+ * repaint. */
+#define GUI_IMG_SLOTS   2
+#define GUI_IMG_MAX_PX  (800 * 512)
 
 /* desktop -> app */
 #define GUI_EVT_RESIZE  1
@@ -72,6 +85,19 @@ void gui_set_title(const char *title);
 void gui_launch(const char *path);
 void gui_close(void);
 void gui_kill(int pid);
+
+/* Bitmap helpers. gui_image_load() copies w*h 0x00RRGGBB pixels into the
+ * desktop-side cache slot (0..GUI_IMG_SLOTS-1); gui_image_draw() then paints
+ * the cached pixels at (x,y), starting at source row `src_y` for `rows` pixel
+ * rows (0 rows = to the end of the image). */
+int  gui_image_load(int slot, int w, int h, const u32 *rgb);
+void gui_image_draw(int slot, int x, int y, int src_y, int rows);
+
+/* Sub-rectangle variants, used for thumbnail atlases: only the w*h pixels of
+ * the requested region travel over the pipe, both in and out. The slot grows
+ * on demand to cover the furthest written pixel. */
+int  gui_image_put(int slot, int x, int y, int w, int h, const u32 *rgb);
+void gui_image_blit(int slot, int x, int y, int sx, int sy, int w, int h);
 
 int  gui_poll(gui_event_t *ev);              /* 1 event, 0 none, -1 gone */
 int  gui_wait(gui_event_t *ev, int timeout_ms);

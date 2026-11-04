@@ -63,6 +63,33 @@ typedef struct PACKED udp_hdr {
     u16 checksum;
 } udp_hdr_t;
 
+typedef struct PACKED tcp_hdr {
+    u16 src_port;
+    u16 dst_port;
+    u32 seq;
+    u32 ack;
+    u8  off;        /* data offset in 4-byte words, high nibble */
+    u8  flags;
+    u16 window;
+    u16 checksum;
+    u16 urgent;
+} tcp_hdr_t;
+
+#define TCP_FIN 0x01
+#define TCP_SYN 0x02
+#define TCP_RST 0x04
+#define TCP_PSH 0x08
+#define TCP_ACK 0x10
+
+#define TCP_CLOSED      0
+#define TCP_SYN_SENT    1
+#define TCP_ESTABLISHED 2
+#define TCP_CLOSE_WAIT  3
+#define TCP_LISTEN      4
+#define TCP_SYN_RCVD    5
+
+#define TCP_RXBUF_SIZE  8192
+
 struct net_socket {
     int used;
     int refs;
@@ -77,6 +104,19 @@ struct net_socket {
     u32 rxaddr;
     u16 rxport;
     u8 rxbuf[2048];
+
+    /* TCP state. Only one direction is tracked: enough for an HTTP client. */
+    u8  state;
+    u8  eof;
+    u32 snd_nxt;
+    u32 rcv_nxt;
+    u32 snd_una;      /* highest sequence byte the peer has acknowledged */
+    u32 peer_wnd;     /* peer's last advertised receive window */
+    u8  listen;       /* 1 = passive socket waiting for SYNs */
+    u8  accepted;     /* handshake finished, an accept() has not taken it yet */
+    struct net_socket *parent;   /* listener that spawned this connection */
+    u32 tcp_len;
+    u8  tcpbuf[TCP_RXBUF_SIZE];
 };
 
 static net_device_t *g_dev;
@@ -123,6 +163,20 @@ static u16 net_checksum(const void *data, u32 len) {
     if (len) sum += (u32)p[0] << 8;
     while (sum >> 16) sum = (sum & 0xFFFFu) + (sum >> 16);
     return (u16)~sum;
+}
+
+/* Unfolded sum, so a pseudo-header contribution can be added before the final
+ * one's complement. */
+static u32 net_sum(const void *data, u32 len) {
+    const u8 *p = (const u8 *)data;
+    u32 sum = 0;
+    while (len > 1) {
+        sum += ((u32)p[0] << 8) | p[1];
+        p += 2;
+        len -= 2;
+    }
+    if (len) sum += (u32)p[0] << 8;
+    return sum;
 }
 
 /* ---- ARP ----------------------------------------------------------- */
@@ -187,7 +241,10 @@ static int arp_resolve(u32 ip, u8 *mac, u32 timeout_ms) {
             kprintf("[net] arp reply received\n");
             return 0;
         }
-        timer_sleep_ms(1);
+        /* task_sleep_ms() yields to the scheduler; timer_sleep_ms() would halt
+         * the CPU with interrupts still masked by the syscall gate, freezing
+         * every task on the machine. */
+        task_sleep_ms(1);
     }
     kprintf("[net] arp timeout\n");
     return -1;
@@ -250,6 +307,220 @@ static int udp_send(u32 dst_ip, u16 src_port, u16 dst_port,
 
 /* ---- receive path -------------------------------------------------- */
 
+/* Locate the socket a segment belongs to. Connected sockets win over a
+ * listener on the same port; a bare SYN with nothing established is what
+ * opens a new connection on the listener. */
+static struct net_socket *tcp_find(u16 dport, u16 sport, u32 src, u32 dst,
+                                   u8 flags) {
+    struct net_socket *listener = NULL;
+
+    for (int i = 0; i < NET_MAX_SOCKETS; i++) {
+        struct net_socket *s = &g_socks[i];
+        if (!s->used || s->type != SOCK_STREAM) continue;
+        if (s->lport != dport) continue;
+        if (s->laddr && s->laddr != dst) continue;
+        if (s->listen) {
+            if (!listener) listener = s;
+            continue;
+        }
+        if (s->state == TCP_SYN_SENT) {
+            if (s->raddr == src && s->rport == sport) return s;
+            continue;
+        }
+        if (s->raddr == src && s->rport == sport) return s;
+    }
+
+    if ((flags & (TCP_SYN | TCP_ACK | TCP_RST)) == TCP_SYN) return listener;
+    return NULL;
+}
+
+/* Pseudo-header sum shared by the TCP checksum. */
+static u32 tcp_pseudo_sum(u32 src, u32 dst, u32 tcp_len) {
+    u32 sum = 0;
+    sum += (src >> 16) & 0xFFFF; sum += src & 0xFFFF;
+    sum += (dst >> 16) & 0xFFFF; sum += dst & 0xFFFF;
+    sum += IP_PROTO_TCP;
+    sum += tcp_len & 0xFFFF;
+    return sum;
+}
+
+/* Raw segment transmit. Every TCP packet goes through here so the checksum
+ * arithmetic lives in exactly one place. */
+static int tcp_xmit(u32 dst, u16 sport, u16 dport, u32 seq, u32 ack,
+                    u8 flags, u16 window, const void *data, u32 len) {
+    u8 buf[sizeof(tcp_hdr_t) + NET_MTU];
+    if (len + sizeof(tcp_hdr_t) > sizeof(buf)) return -EINVAL;
+
+    tcp_hdr_t *t = (tcp_hdr_t *)buf;
+    t->src_port = htons(sport);
+    t->dst_port = htons(dport);
+    t->seq = htonl(seq);
+    t->ack = htonl(ack);
+    t->off = (u8)((sizeof(tcp_hdr_t) / 4) << 4);
+    t->flags = flags;
+    t->window = htons(window);
+    t->checksum = 0;
+    t->urgent = 0;
+    if (len) memcpy(buf + sizeof(tcp_hdr_t), data, len);
+
+    u32 seg = (u32)(sizeof(tcp_hdr_t) + len);
+    u32 sum = net_sum(buf, seg) + tcp_pseudo_sum(g_ip, dst, seg);
+    while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+    t->checksum = htons((u16)~sum);
+
+    return ip_send(dst, IP_PROTO_TCP, buf, seg);
+}
+
+static int tcp_send(struct net_socket *s, u8 flags, const void *data, u32 len) {
+    u32 window = s->tcp_len < TCP_RXBUF_SIZE
+                     ? (u32)(TCP_RXBUF_SIZE - s->tcp_len) : 0;
+    int rc = tcp_xmit(s->raddr, s->lport, s->rport, s->snd_nxt, s->rcv_nxt,
+                      flags, (u16)window, data, len);
+    if (rc != 0) return rc;
+
+    if (flags & (TCP_SYN | TCP_FIN)) s->snd_nxt++;
+    s->snd_nxt += len;
+    if (flags & TCP_FIN) s->state = TCP_CLOSE_WAIT;
+    return (int)len;
+}
+
+/* Nothing is listening on that port: answer the SYN with RST+ACK so the peer
+ * gives up immediately instead of retransmitting for a minute. Best effort --
+ * without an ARP entry there is nowhere to send the refusal. */
+static void tcp_refuse(u16 dport, u16 sport, u32 src, u32 seq) {
+    u8 mac[ETH_ALEN];
+    if (arp_lookup(src, mac) != 0) return;
+    tcp_xmit(src, dport, sport, 0, seq + 1, TCP_RST | TCP_ACK, 0, NULL, 0);
+}
+
+/* Turn an incoming SYN into a half-open connection chained to the listener. */
+static struct net_socket *tcp_passive_open(struct net_socket *ls, u16 sport,
+                                           u32 src, u32 dst, u32 seq,
+                                           u16 peer_window) {
+    struct net_socket *s = NULL;
+
+    for (int i = 0; i < NET_MAX_SOCKETS; i++) {
+        if (!g_socks[i].used) { s = &g_socks[i]; break; }
+    }
+    if (!s) return NULL;
+
+    memset(s, 0, sizeof(*s));
+    s->used = 1;
+    s->refs = 1;
+    s->type = SOCK_STREAM;
+    s->laddr = ls->laddr ? ls->laddr : dst;
+    s->lport = ls->lport;
+    s->raddr = src;
+    s->rport = sport;
+    s->parent = ls;
+    s->rcv_nxt = seq + 1;
+    /* Any ISN works as long as it is not repeated on this 4-tuple. */
+    s->snd_nxt = (u32)(timer_ticks() * 2654435761u) ^ src;
+    s->snd_una = s->snd_nxt;
+    s->peer_wnd = peer_window ? peer_window : 2048;
+    s->state = TCP_SYN_RCVD;
+
+    if (tcp_send(s, TCP_SYN | TCP_ACK, NULL, 0) < 0) {
+        memset(s, 0, sizeof(*s));
+        return NULL;
+    }
+    return s;
+}
+
+
+static void tcp_receive(const u8 *pkt, u32 plen, u32 src, u32 dst) {
+    if (plen < sizeof(tcp_hdr_t)) return;
+    const tcp_hdr_t *t = (const tcp_hdr_t *)pkt;
+
+    u16 sport = ntohs(t->src_port);
+    u16 dport = ntohs(t->dst_port);
+    u32 seq = ntohl(t->seq);
+    u32 ack = ntohl(t->ack);
+    u8 flags = t->flags;
+
+    struct net_socket *s = tcp_find(dport, sport, src, dst, flags);
+    if (!s) {
+        if ((flags & (TCP_SYN | TCP_ACK | TCP_RST)) == TCP_SYN)
+            tcp_refuse(dport, sport, src, seq);
+        return;
+    }
+
+    if (s->listen) {
+        /* A listener only reacts to a fresh SYN. A retransmitted SYN that
+         * already produced a connection lands on that connection instead,
+         * because tcp_find() prefers the established 4-tuple. */
+        if ((flags & (TCP_SYN | TCP_ACK | TCP_RST)) == TCP_SYN)
+            tcp_passive_open(s, sport, src, dst, seq, ntohs(t->window));
+        return;
+    }
+
+    /* A refused connection answers the SYN with RST+ACK; fail immediately
+     * instead of letting the caller sit out the whole connect timeout. */
+    if (flags & TCP_RST) {
+        s->eof = 1;
+        s->state = TCP_CLOSED;
+        return;
+    }
+
+    /* Our own handshake acknowledgement. */
+    if (s->state == TCP_SYN_SENT) {
+        if ((flags & (TCP_SYN | TCP_ACK)) == (TCP_SYN | TCP_ACK) &&
+            ack == s->snd_nxt) {
+            s->rcv_nxt = seq + 1;
+            s->state = TCP_ESTABLISHED;
+            s->connected = 1;
+            s->snd_una = ack;
+            s->peer_wnd = ntohs(t->window);
+            tcp_send(s, TCP_ACK, NULL, 0);
+        }
+        return;
+    }
+
+    /* The ACK that completes a passively opened connection. */
+    if (s->state == TCP_SYN_RCVD) {
+        if (!(flags & TCP_ACK) || ack != s->snd_nxt) return;
+        s->state = TCP_ESTABLISHED;
+        s->connected = 1;
+        s->accepted = 1;
+    }
+
+    /* Track the peer's acknowledgement point and its receive window, so the
+     * send path can throttle instead of blasting past the receiver. */
+    if ((flags & TCP_ACK) &&
+        (u32)(ack - s->snd_una) <= (u32)(s->snd_nxt - s->snd_una))
+        s->snd_una = ack;
+    s->peer_wnd = ntohs(t->window);
+
+    u32 hdr = (u32)(t->off >> 4) * 4;
+    if (hdr < sizeof(tcp_hdr_t) || hdr > plen) return;
+    u32 dlen = plen - hdr;
+
+    if (dlen > 0) {
+        if (seq != s->rcv_nxt) {
+            /* Out of order: re-acknowledge what we already hold. */
+            if (seq + dlen <= s->rcv_nxt) tcp_send(s, TCP_ACK, NULL, 0);
+            return;
+        }
+        u32 room = TCP_RXBUF_SIZE - s->tcp_len;
+        if (dlen > room) {
+            /* No space: advertise the closed window and drop the segment so the
+             * peer retries once the application has read. */
+            tcp_send(s, TCP_ACK, NULL, 0);
+            return;
+        }
+        memcpy(s->tcpbuf + s->tcp_len, pkt + hdr, dlen);
+        s->tcp_len += dlen;
+        s->rcv_nxt += dlen;
+        tcp_send(s, TCP_ACK, NULL, 0);
+    }
+
+    if (flags & TCP_FIN) {
+        s->rcv_nxt++;
+        s->eof = 1;
+        tcp_send(s, TCP_ACK, NULL, 0);
+    }
+}
+
 static struct net_socket *udp_find(u16 dst_port, u32 dst_ip) {
     for (int i = 0; i < NET_MAX_SOCKETS; i++) {
         struct net_socket *s = &g_socks[i];
@@ -308,6 +579,9 @@ static void ip_receive(const u8 *pkt, u32 len) {
         s->rx_ready = 1;
         break;
     }
+    case IP_PROTO_TCP:
+        tcp_receive(payload, plen, src, dst);
+        break;
     default:
         break;
     }
@@ -519,6 +793,21 @@ void net_socket_close(struct net_socket *s) {
         s->refs--;
         return;
     }
+
+    if (s->type == SOCK_STREAM && s->listen) {
+        /* Tear down everything this listener spawned: without the port there
+         * is nobody left to serve those connections. */
+        for (int i = 0; i < NET_MAX_SOCKETS; i++) {
+            struct net_socket *c = &g_socks[i];
+            if (!c->used || c->parent != s) continue;
+            if (c->state == TCP_ESTABLISHED)
+                tcp_send(c, TCP_FIN | TCP_ACK, NULL, 0);
+            memset(c, 0, sizeof(*c));
+        }
+    } else if (s->type == SOCK_STREAM && s->state == TCP_ESTABLISHED) {
+        /* Tell the peer before the state disappears; best effort only. */
+        tcp_send(s, TCP_FIN | TCP_ACK, NULL, 0);
+    }
     memset(s, 0, sizeof(*s));
 }
 
@@ -538,20 +827,141 @@ int net_socket_bind(struct net_socket *s, u32 ip, u16 port) {
     return 0;
 }
 
+/* Passive open: reserve a port and let inbound SYNs create connections.
+ * accept() then hands them to the server loop one at a time. */
+int net_socket_listen(struct net_socket *s, u16 port) {
+    if (!s) return -EBADF;
+    if (s->type != SOCK_STREAM) return -EINVAL;
+    if (!port) return -EINVAL;
+
+    for (int i = 0; i < NET_MAX_SOCKETS; i++) {
+        struct net_socket *o = &g_socks[i];
+        if (o == s || !o->used || o->type != SOCK_STREAM) continue;
+        if (o->lport == port) return -EADDRINUSE;
+    }
+
+    s->lport = port;
+    s->listen = 1;
+    s->state = TCP_LISTEN;
+    return 0;
+}
+
+/* Returns a connection whose handshake finished, or NULL. Never blocks; the
+ * caller polls this from its own loop. */
+struct net_socket *net_socket_accept(struct net_socket *ls, u32 *ip, u16 *port) {
+    if (!ls || !ls->listen) return NULL;
+    net_poll();
+
+    for (int i = 0; i < NET_MAX_SOCKETS; i++) {
+        struct net_socket *s = &g_socks[i];
+        if (!s->used || s->parent != ls || !s->accepted) continue;
+        s->accepted = 0;
+        if (ip) *ip = s->raddr;
+        if (port) *port = s->rport;
+        return s;
+    }
+    return NULL;
+}
+
+/* Number of connections now waiting for accept(). */
+int net_socket_backlog(struct net_socket *ls) {
+    int n = 0;
+    if (!ls || !ls->listen) return 0;
+    for (int i = 0; i < NET_MAX_SOCKETS; i++) {
+        if (g_socks[i].used && g_socks[i].parent == ls && g_socks[i].accepted) n++;
+    }
+    return n;
+}
+
 int net_socket_connect(struct net_socket *s, u32 ip, u16 port) {
     if (!s) return -EBADF;
-    if (s->type == SOCK_STREAM) return -ENOSYS; /* TCP arrives in M6.1 */
+    if (s->type != SOCK_STREAM) {
+        s->raddr = ip;
+        s->rport = port;
+        s->connected = 1;
+        if (!s->lport) s->lport = ephemeral_port();
+        return 0;
+    }
+
+    if (!g_dev) return -ENODEV;
+
     s->raddr = ip;
     s->rport = port;
-    s->connected = 1;
     if (!s->lport) s->lport = ephemeral_port();
-    return 0;
+    s->snd_nxt = (u32)(timer_ticks() * 2654435761u);
+    s->rcv_nxt = 0;
+    s->tcp_len = 0;
+    s->eof = 0;
+    s->state = TCP_SYN_SENT;
+
+    int rc = tcp_send(s, TCP_SYN, NULL, 0);
+    if (rc < 0) {
+        s->state = TCP_CLOSED;
+        return rc;
+    }
+
+    /* Wait for the SYN-ACK. The backlog is drained by net_poll(), so the reply
+     * is handled right here inside tcp_receive(). Sleep through the scheduler:
+     * this runs in syscall context, where the timer interrupt is masked and a
+     * cpu_hlt() wait would wedge the whole machine. */
+    u64 deadline = timer_uptime_ms() + 5000;
+    while (timer_uptime_ms() < deadline) {
+        net_poll();
+        if (s->state == TCP_ESTABLISHED) {
+            kprintf("[net] tcp connected to %u.%u.%u.%u:%u\n",
+                    (ip >> 24) & 0xFF, (ip >> 16) & 0xFF, (ip >> 8) & 0xFF,
+                    ip & 0xFF, port);
+            return 0;
+        }
+        if (s->state == TCP_CLOSED) {
+            kprintf("[net] tcp connection refused\n");
+            return -ECONNREFUSED;
+        }
+        task_sleep_ms(1);
+    }
+
+    s->state = TCP_CLOSED;
+    kprintf("[net] tcp connect timeout\n");
+    return -ETIMEDOUT;
 }
 
 int net_socket_sendto(struct net_socket *s, const void *buf, u64 len,
                       u32 ip, u16 port) {
     if (!s) return -EBADF;
-    if (s->type != SOCK_DGRAM) return -ENOSYS;
+
+    if (s->type == SOCK_STREAM) {
+        if (!s->connected || s->state != TCP_ESTABLISHED) return -ENOTCONN;
+        if (len == 0) return 0;
+        /* Chunk the payload across segments once it no longer fits one frame. */
+        const u8 *p = (const u8 *)buf;
+        u64 left = len;
+        u64 deadline = timer_uptime_ms() + 10000;
+        while (left > 0) {
+            /* Stay inside the peer's receive window. There is no
+             * retransmission here, so a segment pushed at a full buffer is
+             * simply lost -- and a framebuffer update is orders of magnitude
+             * bigger than any plausible receive buffer. */
+            for (;;) {
+                u32 inflight = (u32)(s->snd_nxt - s->snd_una);
+                if (s->peer_wnd && inflight < s->peer_wnd) break;
+                net_poll();
+                inflight = (u32)(s->snd_nxt - s->snd_una);
+                if (s->peer_wnd && inflight < s->peer_wnd) break;
+                if (s->state != TCP_ESTABLISHED) return -ENOTCONN;
+                if (timer_uptime_ms() > deadline) return -ETIMEDOUT;
+                task_sleep_ms(1);
+            }
+
+            u32 chunk = (u32)(left > NET_MTU - sizeof(tcp_hdr_t)
+                                  ? NET_MTU - sizeof(tcp_hdr_t) : left);
+            int rc = tcp_send(s, TCP_PSH | TCP_ACK, p, chunk);
+            if (rc < 0) return rc;
+            p += chunk;
+            left -= chunk;
+        }
+        return (int)len;
+    }
+
     if (!s->lport) s->lport = ephemeral_port();
 
     int rc = udp_send(ip, s->lport, port, buf, (u32)len);
@@ -561,6 +971,22 @@ int net_socket_sendto(struct net_socket *s, const void *buf, u64 len,
 int net_socket_recvfrom(struct net_socket *s, void *buf, u64 len,
                         u32 *ip, u16 *port) {
     if (!s) return -EBADF;
+
+    if (s->type == SOCK_STREAM) {
+        net_poll();
+        if (s->tcp_len == 0) {
+            /* A cleanly closed connection reports end of stream. */
+            return s->eof ? 0 : -EAGAIN;
+        }
+        u32 n = s->tcp_len;
+        if (n > len) n = (u32)len;
+        memcpy(buf, s->tcpbuf, n);
+        if (n < s->tcp_len) memmove(s->tcpbuf, s->tcpbuf + n, s->tcp_len - n);
+        s->tcp_len -= n;
+        /* Reopen the window so the peer may send the next burst. */
+        if (s->state == TCP_ESTABLISHED) tcp_send(s, TCP_ACK, NULL, 0);
+        return (int)n;
+    }
 
     net_poll();
     if (!s->rx_ready) return -EAGAIN;
@@ -576,7 +1002,7 @@ int net_socket_recvfrom(struct net_socket *s, void *buf, u64 len,
 
 int net_socket_send(struct net_socket *s, const void *buf, u64 len) {
     if (!s) return -EBADF;
-    if (!s->connected) return -ENOTCONN;
+    if (s->type != SOCK_STREAM) return -ENOTCONN;
     return net_socket_sendto(s, buf, len, s->raddr, s->rport);
 }
 
@@ -587,6 +1013,7 @@ int net_socket_recv(struct net_socket *s, void *buf, u64 len) {
 int net_socket_readable(struct net_socket *s) {
     if (!s) return 0;
     net_poll();
+    if (s->type == SOCK_STREAM) return s->tcp_len != 0 || s->eof;
     return s->rx_ready != 0;
 }
 
@@ -605,6 +1032,8 @@ void net_task_cleanup(struct task *t) {
 
 u32 net_my_ip(void) { return g_ip; }
 u32 net_gateway(void) { return g_gateway; }
+u32 net_netmask(void) { return g_netmask; }
+u32 net_dns_server(void) { return g_dns; }
 const u8 *net_my_mac(void) { return g_dev ? g_dev->mac : NULL; }
 
 void net_dump(void) {

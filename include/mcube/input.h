@@ -61,6 +61,9 @@ typedef struct PACKED input_event {
 void input_init(void);
 void input_push_key(u32 code);
 void input_push_mouse(i32 dx, i32 dy, u32 buttons);
+/* Absolute pointing device (USB tablet / touch digitizer): the coordinates
+ * are screen pixels, not deltas. */
+void input_push_abs(i32 x, i32 y, u32 buttons);
 void input_mouse_byte(u8 byte);       /* raw PS/2 packet byte from IRQ1/IRQ12 */
 int  input_pop(input_event_t *out);   /* 1 = event, 0 = empty */
 void input_mouse_bounds(u32 width, u32 height);

@@ -17,6 +17,9 @@ files only.
 
 Usage:
   mkinitrd.py OUT.img --kernel KERNEL.ELF --model TINY.GGU [--prog X.LGY ...]
+              [--asset PICTURE.PNG ...]
+
+--asset copies a file into /pictures/ (the album scans that directory).
 """
 
 import argparse
@@ -40,6 +43,7 @@ def main():
     ap.add_argument("--kernel", required=True)
     ap.add_argument("--model")
     ap.add_argument("--prog", action="append", default=[])
+    ap.add_argument("--asset", action="append", default=[])
     args = ap.parse_args()
 
     entries = []
@@ -49,6 +53,9 @@ def main():
     for p in args.prog:
         name = p.replace("\\", "/").rsplit("/", 1)[-1]
         add(entries, "bin/" + name, p)
+    for p in args.asset:
+        name = p.replace("\\", "/").rsplit("/", 1)[-1]
+        add(entries, "pictures/" + name, p)
 
     entries.sort(key=lambda e: e[0])
 

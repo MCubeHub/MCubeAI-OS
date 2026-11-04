@@ -42,6 +42,8 @@ int  net_ping(u32 ip, u32 timeout_ms);
 int  net_dns_lookup(const char *name, u32 *ip_out, u32 timeout_ms);
 u32  net_my_ip(void);
 u32  net_gateway(void);
+u32  net_netmask(void);
+u32  net_dns_server(void);
 const u8 *net_my_mac(void);
 void net_dump(void);
 int  net_selftest(void);

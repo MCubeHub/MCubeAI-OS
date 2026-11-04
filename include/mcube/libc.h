@@ -66,6 +66,14 @@ int   taskinfo(mcube_task_info_t *buf, int max);
 int   hwinfo(mcube_hw_info_t *info);
 pid_t spawn(const char *path, char *const argv[], int cmd_fd, int evt_fd);
 
+/* Power management: MCUBE_POWER_REBOOT / MCUBE_POWER_OFF. Both do not
+ * return. */
+void  mc_power(int action);
+int   mc_dns_lookup(const char *name, u32 *ip_out);
+int   net_info(mcube_net_info_t *info);
+int   battery_info(mcube_battery_info_t *info);
+int   usb_info(mcube_usb_info_t *info);
+
 void *brk(void *addr);
 void *sbrk(long delta);
 

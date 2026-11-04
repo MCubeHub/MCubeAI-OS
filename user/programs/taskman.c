@@ -67,6 +67,9 @@ static void kill_selected(void) {
     gui_kill((int)pid);
     snprintf(g_status, sizeof(g_status), "sent SIGTERM to pid %u", pid);
     g_need_redraw = 1;
+
+    /* Drop the row right away instead of waiting for the next desktop tick. */
+    refresh();
 }
 
 static void button_rect(int w, int h, int *bx, int *by, int *bw, int *bh) {

@@ -88,11 +88,51 @@ static void serial_putc(char c) {
 }
 
 static EFI_BOOT_SERVICES *BS;
+static EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *CO;
 
-/* The loader logs to the 16550 UART directly. OVMF's ConOut usually includes
- * the serial terminal, so also writing through ConOut would duplicate every
- * byte; the kernel paints the screen a few milliseconds later anyway. */
+/* Allocate below the identity window: everything handed to the kernel is
+ * dereferenced through the loader's low identity map, so an allocation above
+ * IDENTITY_MAP_GIB would fault the moment the kernel touches it. */
+static EFI_STATUS alloc_low(UINTN pages, EFI_PHYSICAL_ADDRESS *out) {
+    EFI_PHYSICAL_ADDRESS p = IDENTITY_MAP_GIB * GiB;
+    EFI_STATUS st = BS->AllocatePages(AllocateMaxAddress, EfiLoaderData, pages, &p);
+    if (EFI_ERROR(st)) {
+        p = 0;
+        st = BS->AllocatePages(AllocateAnyPages, EfiLoaderData, pages, &p);
+    }
+    if (EFI_ERROR(st)) return st;
+    *out = p;
+    return EFI_SUCCESS;
+}
+
+/* Log to the UART and to the firmware console. A physical machine without a
+ * serial port must show where boot stopped, so screen output wins over the
+ * duplicated bytes on OVMF's serial-backed console. */
+static void screen_write(const char *s) {
+    CHAR16 buf[128];
+    int n = 0;
+    while (*s) {
+        char c = *s++;
+        if (c == '\n') {
+            buf[n++] = '\r';
+            buf[n++] = '\n';
+        } else {
+            buf[n++] = (CHAR16)(u8)c;
+        }
+        if (n >= 126) {
+            buf[n] = 0;
+            CO->OutputString(CO, buf);
+            n = 0;
+        }
+    }
+    if (n) {
+        buf[n] = 0;
+        CO->OutputString(CO, buf);
+    }
+}
+
 static void print(const char *s) {
+    if (CO) screen_write(s);
     while (*s) serial_putc(*s++);
 }
 
@@ -239,15 +279,17 @@ static EFI_STATUS load_initrd(EFI_HANDLE image, boot_info_t *bi) {
     }
 
     u64 pages = (fsize + PAGE_SIZE - 1) / PAGE_SIZE;
-    EFI_PHYSICAL_ADDRESS pa = 0xFFFFFFFFULL;
-    st = BS->AllocatePages(AllocateMaxAddress, EfiLoaderData, pages, &pa);
-    if (EFI_ERROR(st)) {
-        pa = 0;
-        st = BS->AllocatePages(AllocateAnyPages, EfiLoaderData, pages, &pa);
-    }
+    EFI_PHYSICAL_ADDRESS pa = 0;
+    st = alloc_low(pages, &pa);
     if (EFI_ERROR(st)) {
         f->Close(f);
         return st;
+    }
+    /* The kernel only maps the first IDENTITY_MAP_GIB gigabytes. */
+    if (pa + fsize > IDENTITY_MAP_GIB * GiB) {
+        f->Close(f);
+        print("[MCUBOOT] initrd does not fit below 64 GiB\n");
+        return EFI_OUT_OF_RESOURCES;
     }
 
     u64 got = 0;
@@ -358,7 +400,29 @@ static EFI_STATUS map_2mb(u64 *pml4, u64 va, u64 pa, u64 size) {
     return EFI_SUCCESS;
 }
 
-static EFI_STATUS build_page_tables(u64 *out_pml4) {
+/* Tag the 2 MiB pages covering [va, va+size) as write-through (PWT). The range
+ * is already mapped; this only changes the memory type of the leaf entries.
+ *
+ * A framebuffer left at the default write-back type is lethal on real
+ * hardware: the CPU buffers the pixels in cache, the scanout engine keeps
+ * reading stale DRAM, and the machine looks dead while the kernel is happily
+ * running. PWT selects PAT entry 1, which the kernel repoints at
+ * write-combining (see percpu.c pat_init) once its own CPU init runs. */
+static void tag_2mb_pwt(u64 *pml4, u64 va, u64 size) {
+    for (u64 off = 0; off < size; off += 2 * MiB) {
+        u64 v = va + off;
+        u64 e = pml4[L4(v)];
+        if (!(e & 1)) continue;
+        u64 *pdpt = (u64 *)(uptr)(e & PTE_ADDR_MASK);
+        e = pdpt[L3(v)];
+        if (!(e & 1)) continue;
+        u64 *pd = (u64 *)(uptr)(e & PTE_ADDR_MASK);
+        if (!(pd[L2(v)] & 1)) continue;
+        pd[L2(v)] |= 0x08; /* PWT */
+    }
+}
+
+static EFI_STATUS build_page_tables(u64 *out_pml4, u64 fb_base, u64 fb_size) {
     EFI_PHYSICAL_ADDRESS pml4_phys = 0;
     EFI_STATUS st = alloc_zero_page(&pml4_phys);
     if (EFI_ERROR(st)) return st;
@@ -370,30 +434,84 @@ static EFI_STATUS build_page_tables(u64 *out_pml4) {
     /* Direct map: kernel can turn any physical address into a pointer. */
     st = map_2mb(pml4, MCUBE_DIRECT_MAP_BASE, 0, IDENTITY_MAP_GIB * GiB);
     if (EFI_ERROR(st)) return st;
-    /* Higher-half kernel window: physical 0..2 GiB. */
-    st = map_2mb(pml4, MCUBE_KERNEL_VBASE, 0, 2 * GiB);
+    /* Higher-half kernel window. This covers the whole identity window, not
+     * just the first 2 GiB: firmware is free to hand back the boot stack,
+     * the Boot Info Block or the initrd above 2 GiB (machines with 8+ GiB do
+     * exactly that), and `MCUBE_KERNEL_VBASE + phys` has to resolve for every
+     * one of them or the kernel faults on its first stack push. */
+    st = map_2mb(pml4, MCUBE_KERNEL_VBASE, 0, IDENTITY_MAP_GIB * GiB);
     if (EFI_ERROR(st)) return st;
+
+    /* Some firmware (Intel UHD, AMD APUs, recent laptops) puts the
+     * framebuffer far above the identity window. Map that tail explicitly,
+     * otherwise the very first splash pixel is a page fault and the machine
+     * looks dead. */
+    if (fb_base && fb_size) {
+        u64 lo = ALIGN_DOWN(fb_base, 2 * MiB);
+        u64 hi = ALIGN_UP(fb_base + fb_size, 2 * MiB);
+        if (hi > IDENTITY_MAP_GIB * GiB && lo < 512 * GiB) {
+            st = map_2mb(pml4, lo, lo, hi - lo);
+            if (EFI_ERROR(st)) return st;
+            st = map_2mb(pml4, MCUBE_DIRECT_MAP_BASE + lo, lo, hi - lo);
+            if (EFI_ERROR(st)) return st;
+        }
+        /* ...and pin it to a non-cached memory type wherever it landed. */
+        tag_2mb_pwt(pml4, lo, hi - lo);
+        tag_2mb_pwt(pml4, MCUBE_DIRECT_MAP_BASE + lo, hi - lo);
+        tag_2mb_pwt(pml4, MCUBE_KERNEL_VBASE + lo, hi - lo);
+    }
 
     *out_pml4 = pml4_phys;
     return EFI_SUCCESS;
 }
 
+/* ------------------------------------------------------------------ */
+/* On-screen boot progress                                            */
+/* ------------------------------------------------------------------ */
+/* Once boot services are gone there is no text console left. Painting a
+ * plain rectangle straight into the linear framebuffer still works, and it
+ * is the only way to tell a machine that died inside ExitBootServices from
+ * one that died in the kernel before its console came up. */
+static u64 g_mark_base;
+static u32 g_mark_pitch;
+
+static void boot_mark(int step) {
+    if (!g_mark_base || !g_mark_pitch) return;
+    u32 y0 = 20;
+    u32 x0 = 20 + (u32)step * 28;
+    for (u32 y = 0; y < 16; y++) {
+        u32 *row = (u32 *)(uptr)(g_mark_base + (u64)(y0 + y) * g_mark_pitch);
+        for (u32 x = 0; x < 20; x++) row[x0 + x] = 0x0000C8FFu;
+    }
+}
+
 static void enter_kernel(u64 entry, u64 cr3, u64 stack_top, boot_info_t *bi) NORETURN;
 static void enter_kernel(u64 entry, u64 cr3, u64 stack_top, boot_info_t *bi) {
+    /* Firmware may leave 5-level paging switched on (CR4.LA57). Our tables are
+     * four levels deep, so with LA57 set the CPU would read them as a PML5 and
+     * the first instruction fetch would fault into a triple fault: a silent
+     * freeze with the loader's last line still on screen. */
+    u64 cr4;
+    __asm__ __volatile__("mov %%cr4, %0" : "=r"(cr4));
+    cr4 &= ~(1ULL << 12); /* LA57 */
+    __asm__ __volatile__("mov %0, %%cr4" : : "r"(cr4) : "memory");
+
     u64 cr0;
     __asm__ __volatile__("mov %%cr0, %0" : "=r"(cr0));
     cr0 |= (1ULL << 31) | (1ULL << 16); /* PG | WP */
     __asm__ __volatile__("mov %0, %%cr0" : : "r"(cr0) : "memory");
 
+    /* Interrupts off and our own page tables live from here on. */
+    __asm__ __volatile__("cli\n\tmovq %0, %%cr3\n\t" : : "r"(cr3) : "memory");
+    boot_mark(2);
+
     __asm__ __volatile__(
-        "cli\n\t"
-        "movq %[cr3], %%cr3\n\t"
         "movq %[stack], %%rsp\n\t"
         "xorq %%rbp, %%rbp\n\t"
         "movq %[bi], %%rdi\n\t"
         "jmpq *%[entry]\n\t"
         :
-        : [cr3] "r"(cr3), [stack] "r"(stack_top), [bi] "r"(bi), [entry] "r"(entry)
+        : [stack] "r"(stack_top), [bi] "r"(bi), [entry] "r"(entry)
         : "memory");
 
     for (;;) __asm__ __volatile__("hlt");
@@ -457,24 +575,104 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *systab) {
     BS = systab->BootServices;
     serial_init();
 
+    CO = systab->ConOut;
+    if (CO) {
+        CO->Reset(CO, 0);
+        CO->SetAttribute(CO, 0x07);
+        CO->ClearScreen(CO);
+    }
+
     print("\n[MCUBOOT] MCubeAIOS UEFI loader v" BOOTINFO_VERSION_STRING "\n");
+    print("[MCUBOOT] screen log active, resolving boot devices...\n");
 
     BS->SetWatchdogTimer(0, 0, 0, NULL);
 
-    /* Graphics output (frame buffer handed to the kernel). */
+    /* Graphics output (frame buffer handed to the kernel). Pick the largest
+     * mode the firmware advertises instead of inheriting whatever the console
+     * happened to run at; GOP defaults are often 1024x768 or lower, which is
+     * why the desktop looked coarse. Selection is best-effort: if no mode wins
+     * we keep the current one. */
     EFI_GRAPHICS_OUTPUT_PROTOCOL *gop = NULL;
     EFI_STATUS st = BS->LocateProtocol(&gEfiGraphicsOutputProtocolGuid, NULL, (void **)&gop);
     if (EFI_ERROR(st) || !gop || !gop->Mode || !gop->Mode->Info) {
         fail("no GOP frame buffer", st);
     }
+
+    {
+        UINT32 best = gop->Mode->Mode;
+        UINT32 best_px = 0;
+        UINT32 max_mode = gop->Mode->MaxMode;
+
+        /* Pass 1: panel-shaped linear modes. */
+        for (UINT32 m = 0; m < max_mode; m++) {
+            EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *info = NULL;
+            UINTN size = 0;
+            if (EFI_ERROR(gop->QueryMode(gop, m, &size, &info)) || !info) continue;
+
+            /* Only the packed 32-bit layouts (0 = RGBReserved, 1 =
+             * BGRReserved) match the kernel's blitters. 2 = BltOnly has no
+             * linear frame buffer at all: FrameBufferBase is meaningless. */
+            if (info->PixelFormat > 1) continue;
+
+            UINT32 w = info->HorizontalResolution, h = info->VerticalResolution;
+            /* Reject modes no panel actually has: OVMF on QEMU advertises
+             * 2048x2048 and higher, which would only make the desktop huge and
+             * blurry-scaled. Accept landscape 4:3 .. 16:9 within 1920x1200. */
+            if (w > 1920 || h > 1200 || w < 640 || h < 480) continue;
+            if (w * 10 < h * 13 || w * 10 > h * 18) continue;
+
+            UINT32 px = w * h;
+            if (px > best_px) {
+                best_px = px;
+                best = m;
+            }
+        }
+
+        /* Pass 2: nothing matched the shape filter (a 4K-only panel, for
+         * instance). Fall back to the largest linear mode the firmware offers
+         * rather than sticking with a BltOnly mode we cannot draw into. */
+        if (best_px == 0) {
+            for (UINT32 m = 0; m < max_mode; m++) {
+                EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *info = NULL;
+                UINTN size = 0;
+                if (EFI_ERROR(gop->QueryMode(gop, m, &size, &info)) || !info) continue;
+                if (info->PixelFormat > 1) continue;
+                UINT32 w = info->HorizontalResolution, h = info->VerticalResolution;
+                if (w < 640 || h < 480) continue;
+                UINT32 px = w * h;
+                if (px > best_px && px <= 4096u * 2304u) {
+                    best_px = px;
+                    best = m;
+                }
+            }
+        }
+
+        if (best != gop->Mode->Mode) {
+            if (EFI_ERROR(gop->SetMode(gop, best))) {
+                print("[MCUBOOT] GOP mode switch refused, keeping current\n");
+            }
+        }
+    }
+
     EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *gmode = gop->Mode->Info;
+    if (gmode->PixelFormat > 1) {
+        /* No linear frame buffer: the kernel has nothing to draw on and would
+         * silently paint into a BltOnly stub. Stop with a readable message
+         * instead of a black screen. */
+        fail("GOP is BltOnly, no linear frame buffer", 0);
+    }
+
     print("[MCUBOOT] GOP ");
     print_dec(gmode->HorizontalResolution);
     print("x");
     print_dec(gmode->VerticalResolution);
+    print(" fmt ");
+    print_dec(gmode->PixelFormat);
     print(" @ ");
     print_hex(gop->Mode->FrameBufferBase);
     print("\n");
+    g_mark_base = gop->Mode->FrameBufferBase;
+    g_mark_pitch = gmode->PixelsPerScanLine * 4;
 
     /* ACPI RSDP. */
     u64 rsdp = 0;
@@ -515,8 +713,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *systab) {
     print(" bytes\n");
 
     boot_info_t *bi = NULL;
-    st = BS->AllocatePages(AllocateAnyPages, EfiLoaderData, 1, (EFI_PHYSICAL_ADDRESS *)&bi);
-    if (EFI_ERROR(st) || !bi) fail("no boot info page", st);
+    EFI_PHYSICAL_ADDRESS bi_page = 0;
+    st = alloc_low(1, &bi_page);
+    if (EFI_ERROR(st) || !bi_page) fail("no boot info page", st);
+    bi = (boot_info_t *)(uptr)bi_page;
     memset(bi, 0, PAGE_SIZE);
 
     st = load_elf(kimage, ksize, bi);
@@ -533,13 +733,14 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *systab) {
 
     /* Boot stack. */
     EFI_PHYSICAL_ADDRESS stack_base = 0;
-    st = BS->AllocatePages(AllocateAnyPages, EfiLoaderData, BOOT_STACK_PAGES, &stack_base);
+    st = alloc_low(BOOT_STACK_PAGES, &stack_base);
     if (EFI_ERROR(st)) fail("no boot stack", st);
     bi->loader_stack_top = stack_base + BOOT_STACK_PAGES * PAGE_SIZE;
 
     /* Page tables. */
     u64 pml4_phys = 0;
-    st = build_page_tables(&pml4_phys);
+    st = build_page_tables(&pml4_phys, gop->Mode->FrameBufferBase,
+                           gop->Mode->FrameBufferSize);
     if (EFI_ERROR(st)) fail("cannot build page tables", st);
     bi->pml4_phys = pml4_phys;
     print("[MCUBOOT] pml4 ");
@@ -563,10 +764,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *systab) {
     u32 efi_count = (u32)(sz / desc_size);
 
     u64 map_bytes = ALIGN_UP((u64)(efi_count + 16) * sizeof(boot_mem_entry_t), PAGE_SIZE);
-    boot_mem_entry_t *entries = NULL;
-    st = BS->AllocatePages(AllocateAnyPages, EfiLoaderData, map_bytes / PAGE_SIZE,
-                           (EFI_PHYSICAL_ADDRESS *)&entries);
+    EFI_PHYSICAL_ADDRESS entries_pa = 0;
+    st = alloc_low(map_bytes / PAGE_SIZE, &entries_pa);
     if (EFI_ERROR(st)) fail("no boot info memmap page", st);
+    boot_mem_entry_t *entries = (boot_mem_entry_t *)(uptr)entries_pa;
 
     /* Fill the Boot Info Block (everything except the memmap copy). */
     bi->magic = BOOTINFO_MAGIC;
@@ -608,6 +809,9 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *systab) {
     }
     if (!exited) fail("ExitBootServices failed", st);
 
+    /* First mark: firmware services are gone and we are still running. */
+    boot_mark(0);
+
     u32 out_count = efi_count;
     if (out_count > (u32)(map_bytes / sizeof(boot_mem_entry_t))) {
         out_count = (u32)(map_bytes / sizeof(boot_mem_entry_t));
@@ -615,6 +819,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *systab) {
     copy_memmap((EFI_MEMORY_DESCRIPTOR *)map_buf, out_count, (u32)desc_size, entries, bi);
     bi->memmap_count = out_count;
     bi->memmap_addr = (u64)(uptr)entries;
+    boot_mark(1);
 
     /* No firmware services from here on. */
     enter_kernel(bi->kernel_entry, bi->pml4_phys,

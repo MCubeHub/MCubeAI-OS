@@ -20,6 +20,9 @@ SERIAL_LOG=${SERIAL_LOG:-$BUILD/serial-$MEDIUM.log}
 AHCI_IMG=${AHCI_IMG:-$BUILD/ahci.img}
 DISK_IMG=${DISK_IMG:-$BUILD/disk.img}
 
+FIRMWARE=(-drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
+          -drive if=pflash,format=raw,file="$BUILD/OVMF_VARS.fd")
+
 case "$MEDIUM" in
     esp)  BOOT_MEDIA=(-drive file="$BUILD/esp.img",format=raw,if=ide) ;;
     disk) BOOT_MEDIA=(-drive file="$DISK_IMG",format=raw,if=ide) ;;
@@ -27,12 +30,25 @@ case "$MEDIUM" in
                      -drive file="$DISK_IMG",format=raw,if=none,id=usbstick \
                      -device usb-storage,drive=usbstick) ;;
     iso)  BOOT_MEDIA=(-cdrom "$ISO_IMG") ;;
-    *)    echo "unknown MEDIUM=$MEDIUM (esp|disk|usb|iso)" >&2; exit 2 ;;
+    # Legacy BIOS: no OVMF, QEMU falls back to its built-in SeaBIOS. The
+    # boot code is the 432-byte stage1 MBR, not the firmware's EFI loader.
+    bios) BOOT_MEDIA=(-drive file="$DISK_IMG",format=raw,if=ide)
+          FIRMWARE=() ;;
+    # Same, but with the ISO written to the stick in DD mode: firmware then
+    # sees a hard disk, runs the isohybrid MBR and never touches El Torito.
+    # (SeaBIOS cannot boot this ISO as a CD -- its El Torito catalog only has
+    # the UEFI entry -- which is why this case attaches it as a drive.)
+    bios-iso) BOOT_MEDIA=(-drive file="$ISO_IMG",format=raw,if=ide)
+          FIRMWARE=() ;;
+    *)    echo "unknown MEDIUM=$MEDIUM (esp|disk|usb|iso|bios|bios-iso)" >&2
+          exit 2 ;;
 esac
 
 cd "$(dirname "$0")/.."
 
-cp -f "$OVMF_VARS" "$BUILD/OVMF_VARS.fd"
+if [ ${#FIRMWARE[@]} -ne 0 ]; then
+    cp -f "$OVMF_VARS" "$BUILD/OVMF_VARS.fd"
+fi
 rm -f "$SERIAL_LOG"
 
 # Standalone SATA disk for the AHCI driver: the marker at LBA 0 proves that
@@ -44,8 +60,7 @@ fi
 
 "$QEMU" -machine "$QEMU_MACHINE,accel=$QEMU_ACCEL" -cpu max -m "$QEMU_MEM" \
     -smp "$QEMU_CPUS" \
-    -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
-    -drive if=pflash,format=raw,file="$BUILD/OVMF_VARS.fd" \
+    "${FIRMWARE[@]}" \
     "${BOOT_MEDIA[@]}" \
     -device ich9-ahci,id=ahci \
     -drive file="$AHCI_IMG",format=raw,if=none,id=ahcidisk \

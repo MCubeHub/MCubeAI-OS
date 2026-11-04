@@ -1,10 +1,25 @@
-/* String and memory primitives for user programs. */
-
 #include <mcube/libc.h>
 
+/* String and memory primitives for user programs.
+ *
+ * The copy loops move eight bytes per store on purpose: the framebuffer is
+ * mapped write-combining, and byte-wide stores defeat the write-combining
+ * buffers, making a full-screen present several times slower than it needs
+ * to be. rep movsq lets the CPU burst into the video memory. */
+
 void *memcpy(void *dst, const void *src, size_t n) {
+    if (n == 0) return dst;
+
     u8 *d = (u8 *)dst;
     const u8 *s = (const u8 *)src;
+    size_t q = n >> 3;
+    if (q) {
+        __asm__ volatile ("rep movsq"
+                          : "+D"(d), "+S"(s), "+c"(q)
+                          :
+                          : "memory");
+    }
+    n &= 7;
     while (n--) *d++ = *s++;
     return dst;
 }
@@ -13,18 +28,30 @@ void *memmove(void *dst, const void *src, size_t n) {
     u8 *d = (u8 *)dst;
     const u8 *s = (const u8 *)src;
     if (d == s || n == 0) return dst;
-    if (d < s) {
-        while (n--) *d++ = *s++;
-    } else {
-        d += n;
-        s += n;
-        while (n--) *--d = *--s;
-    }
+    if (d < s || d >= s + n) return memcpy(dst, src, n);
+
+    d += n;
+    s += n;
+    while (n--) *--d = *--s;
     return dst;
 }
 
 void *memset(void *dst, int c, size_t n) {
+    if (n == 0) return dst;
+
     u8 *d = (u8 *)dst;
+    u64 v = (u8)c;
+    v |= v << 8;
+    v |= v << 16;
+    v |= v << 32;
+    size_t q = n >> 3;
+    if (q) {
+        __asm__ volatile ("rep stosq"
+                          : "+D"(d), "+c"(q)
+                          : "a"(v)
+                          : "memory");
+    }
+    n &= 7;
     while (n--) *d++ = (u8)c;
     return dst;
 }

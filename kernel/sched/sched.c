@@ -40,6 +40,11 @@ static u32 g_task_count;
 static void idle_main(void *arg) {
     UNUSED(arg);
     for (;;) {
+        /* Interrupts arrive here masked whenever the idle task was switched in
+         * from a syscall (the syscall gate clears IF). Without an explicit STI
+         * the very first hlt would never wake: no PIT tick, so no sleeping task
+         * could ever be made runnable again. */
+        cpu_sti();
         cpu_hlt();
     }
 }
@@ -470,6 +475,12 @@ u32 task_snapshot(mcube_task_info_t *out, u32 max) {
         task_t *t = g_tasks;
         do {
             if (n >= max) break;
+            /* Terminated tasks are only waiting to be reaped; reporting them
+             * keeps dead rows alive in Task Manager after "End Task". */
+            if (t->state == TASK_DEAD) {
+                t = t->next;
+                continue;
+            }
             out[n].pid = t->pid;
             out[n].ppid = t->ppid;
             out[n].state = t->state;
@@ -489,6 +500,15 @@ u32 task_snapshot(mcube_task_info_t *out, u32 max) {
 
 void sched_start(void) {
     static u64 boot_rsp;
+
+    /* Hand over atomically. g_active turns preemption on, and interrupts are
+     * still live here on the boot stack: a PIT tick landing between that store
+     * and context_switch() would call schedule() from the boot context with
+     * g_current already pointing at idle, so &g_idle->rsp would be overwritten
+     * with a boot-stack frame. The idle task then "resumes" into the abandoned
+     * boot context and dies on a garbage iretq. Keep IF=0 across the handover;
+     * idle_main() re-enables interrupts itself. */
+    cpu_cli();
     g_active = 1;
     g_current = g_idle;
     g_idle->state = TASK_RUNNING;

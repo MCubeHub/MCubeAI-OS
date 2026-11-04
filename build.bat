@@ -5,7 +5,7 @@ rem
 rem  Usage:
 rem      build.bat 1.0.0
 rem      build.bat /v 1.0.0
-rem      build.bat                 (prompts for a version)
+rem      build.bat                 (auto version: yy.MM.dd.HH.mm)
 rem
 rem  Environment:
 rem      MCUBE_WSL_DISTRO   WSL distribution (default: Debian)
@@ -37,9 +37,13 @@ if /I "%~1"=="/v" (
     set "VERSION=%~1"
 )
 
-if not defined VERSION set /p "VERSION=Enter MCubeAIOS version (e.g. 1.0.0): "
+rem No version given on the command line -> derive one from the current time,
+rem e.g. 26.10.25.10.23 (yy.MM.dd.HH.mm). Never fall back to a fixed version.
 if not defined VERSION (
-    echo [ERROR] A version number is required.
+    for /f "usebackq delims=" %%I in (`powershell -NoProfile -Command "Get-Date -Format 'yy.MM.dd.HH.mm'"`) do set "VERSION=%%I"
+)
+if not defined VERSION (
+    echo [ERROR] Could not determine a version number.
     exit /b 2
 )
 
@@ -172,6 +176,50 @@ if not exist "%DIST%\SHA256SUMS.txt" (
     echo [ERROR] Package manifest is missing: %DIST%\SHA256SUMS.txt
     exit /b 1
 )
+if not exist "%DIST%\MCubeAIOS-%VERSION%-usb.img" (
+    echo [ERROR] Expected USB image was not produced: %DIST%\MCubeAIOS-%VERSION%-usb.img
+    exit /b 1
+)
+
+rem Rufus rejects an ISO whose El Torito entry is BIOS-only. Fail the build
+rem instead of shipping a package nobody can flash.
+set "ISO_UEFI="
+for /f "usebackq delims=" %%I in (`wsl.exe -d %MCUBE_WSL_DISTRO% -- bash -lc "xorriso -indev '%REPO_WSL%/dist/MCubeAIOS-%VERSION%/MCubeAIOS-%VERSION%.iso' -report_el_torito plain 2>/dev/null | grep -c UEFI"`) do set "ISO_UEFI=%%I"
+if not defined ISO_UEFI set "ISO_UEFI=0"
+if "%ISO_UEFI%"=="0" (
+    echo [ERROR] ISO has no UEFI El Torito boot entry.
+    echo         Check the xorriso flags in the Makefile ISO rule.
+    exit /b 1
+)
+
+rem A UEFI El Torito entry only helps a CD/DVD drive. Once the same ISO is
+rem written to a USB stick the firmware scans the MBR, so the image must also
+rem carry a partition of type 0xEF pointing at the FAT32 ESP (produced by
+rem xorriso -append_partition). Without it Rufus writes a stick that nothing
+rem can boot.
+set "ISO_ESP="
+for /f "usebackq delims=" %%I in (`wsl.exe -d %MCUBE_WSL_DISTRO% -- bash -lc "xorriso -indev '%REPO_WSL%/dist/MCubeAIOS-%VERSION%/MCubeAIOS-%VERSION%.iso' -report_system_area plain 2>/dev/null | grep -c '0xef'"`) do set "ISO_ESP=%%I"
+if not defined ISO_ESP set "ISO_ESP=0"
+if "%ISO_ESP%"=="0" (
+    echo [ERROR] ISO has no 0xEF ^(EFI System Partition^) MBR entry.
+    echo         A USB stick written from it would not boot in UEFI mode.
+    echo         Check the -append_partition flag in the Makefile ISO rule.
+    exit /b 1
+)
+
+rem Legacy BIOS never reads the El Torito catalog. It runs the 432-byte MBR
+rem written by -isohybrid-mbr, which scans the partition table for the BIOS
+rem payload partition (type 0x83, produced by -append_partition). Without that
+rem entry the stick would only boot on UEFI machines.
+set "ISO_BIOS="
+for /f "usebackq delims=" %%I in (`wsl.exe -d %MCUBE_WSL_DISTRO% -- bash -lc "xorriso -indev '%REPO_WSL%/dist/MCubeAIOS-%VERSION%/MCubeAIOS-%VERSION%.iso' -report_system_area plain 2>/dev/null | grep -c '0x83'"`) do set "ISO_BIOS=%%I"
+if not defined ISO_BIOS set "ISO_BIOS=0"
+if "%ISO_BIOS%"=="0" (
+    echo [ERROR] ISO has no 0x83 ^(BIOS payload^) MBR entry.
+    echo         A USB stick written from it would not boot in legacy BIOS mode.
+    echo         Check the -append_partition flag in the Makefile ISO rule.
+    exit /b 1
+)
 
 rem ---- history archive -----------------------------------------------------
 if not exist "%HISTORY%" mkdir "%HISTORY%"
@@ -194,6 +242,14 @@ echo ============================================================
 echo   Version : %VERSION%
 echo   Package : %DIST%
 echo   Archive : %ZIP%
+echo.
+echo   Flash to USB (both images boot on UEFI *and* legacy BIOS):
+echo     %DIST%\MCubeAIOS-%VERSION%.iso
+echo       Rufus: image mode, partition GPT
+echo     %DIST%\MCubeAIOS-%VERSION%-usb.img
+echo       Rufus: DD mode (byte-for-byte write)
+echo   On a BIOS-only machine pick the non-UEFI USB entry in the boot menu.
+echo   Real hardware: disable Secure Boot in UEFI mode.
 echo.
 powershell -NoProfile -Command "$z=Get-Item -LiteralPath $env:MCUBE_ZIP; Write-Host ('  Zip size: {0:N1} MiB' -f ($z.Length/1MB)); $h=(Get-FileHash -LiteralPath $env:MCUBE_ZIP -Algorithm SHA256).Hash; Write-Host ('  Zip SHA256: ' + $h)"
 echo.

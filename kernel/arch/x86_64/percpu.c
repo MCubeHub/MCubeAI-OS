@@ -14,10 +14,22 @@
 
 percpu_t g_percpu;
 
+#define MSR_PAT 0x277u
+
+/* Default PAT entry 1 is write-through. Repoint it at write-combining so the
+ * framebuffer can be mapped WC instead of UC: its writes then leave the CPU in
+ * bursts instead of one bus transaction per pixel. */
+static void pat_init(void) {
+    u64 pat = read_msr(MSR_PAT);
+    pat = (pat & ~(0xFFULL << 8)) | (0x01ULL << 8);
+    write_msr(MSR_PAT, pat);
+}
+
 void percpu_init(void) {
     memset(&g_percpu, 0, sizeof(g_percpu));
     g_percpu.cpu_id = 0;
 
+    pat_init();
     write_msr(MSR_GS_BASE, (u64)(uptr)&g_percpu);
     write_msr(MSR_KERNEL_GS_BASE, 0);
     kprintf("[cpu] per-cpu block @ %p, GS base armed\n", (void *)&g_percpu);

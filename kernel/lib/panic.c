@@ -2,6 +2,7 @@
 
 #include <mcube/kernel.h>
 #include <mcube/io.h>
+#include <mcube/acpi.h>
 #include <stdarg.h>
 
 static volatile int g_panicking;
@@ -35,13 +36,26 @@ NORETURN void halt_forever(void) {
 }
 
 void reboot_now(void) {
-    kprintf("[panic] rebooting via ACPI reset register...\n");
-    outb(0xCF9, 0x02);
-    outb(0xCF9, 0x06);
+    kprintf("[power] reboot requested\n");
+    /* Platform reset through the FADT reset register first; the chipset and
+     * 8042 fallbacks live inside acpi_reboot(). */
+    acpi_reboot();
+    halt_forever();
+}
+
+/* ACPI S5 (soft off). The control block, SLP_TYP and the ACPI enable handshake
+ * all come from the firmware tables; the legacy emulator ports are only tried
+ * as a last resort for machines that expose no FADT. */
+void power_off(void) {
+    kprintf("[power] shutdown requested\n");
+    acpi_shutdown();
+
+    /* No FADT, or the request was ignored: try the ports QEMU and Bochs use. */
+    outw(0x604, 0x2000);    /* QEMU PIIX4:  SLP_EN | SLP_TYP(5) */
+    outw(0xB004, 0x2000);   /* QEMU ICH9 (q35) */
+    outw(0x4004, 0x3400);   /* Bochs / VirtualBox */
     for (volatile int i = 0; i < 1000000; i++) { }
-    /* Fallback: 8042 keyboard controller pulse reset line. */
-    while (inb(0x64) & 0x02) { }
-    outb(0x64, 0xFE);
+    kprintf("[power] S5 request sent, halting as a fallback\n");
     halt_forever();
 }
 
@@ -49,6 +63,12 @@ static void vpanic(const char *file, int line, const char *fmt, va_list ap) {
     cpu_cli();
     g_panicking++;
     if (g_panicking > 2) halt_forever();
+
+    /* A crash after the boot splash (or after user mode mapped the
+     * framebuffer) would otherwise freeze the last painted frame on screen,
+     * which is indistinguishable from "boot stuck at 100%". Bring the text
+     * console back so the reason is visible on the VM display too. */
+    fb_console_enable();
 
     kprintf("\n");
     kprintf("============================================================\n");
@@ -59,7 +79,7 @@ static void vpanic(const char *file, int line, const char *fmt, va_list ap) {
     kvsnprintf(msg, sizeof(msg), fmt, ap);
     kprintf("%s\n", msg);
     kprintf("  cr2=%p cr3=%p rflags=%p\n",
-            (void *)read_cr2(), (void *)read_cr3(), (void *)(uptr)read_rflags);
+            (void *)read_cr2(), (void *)read_cr3(), (void *)(uptr)read_rflags());
     kprintf("------------------------------------------------------------\n");
     stack_trace();
     kprintf("============================================================\n");

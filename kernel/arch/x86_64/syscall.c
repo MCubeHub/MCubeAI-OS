@@ -19,6 +19,8 @@
 #include <mcube/pipe.h>
 #include <mcube/user.h>
 #include <mcube/ai.h>
+#include <mcube/acpi.h>
+#include <mcube/usb.h>
 
 struct pipe_end;
 
@@ -844,8 +846,11 @@ static long sys_fb_map(void) {
 
     u64 size = ALIGN_UP(info.size, PAGE_SIZE);
     for (u64 off = 0; off < size; off += PAGE_SIZE) {
+        /* PAT index 1 (see pat_init), i.e. write-combining: the desktop
+         * repaints whole rectangles, and UC makes that dominated by per-pixel
+         * bus traffic on emulated hardware. */
         rc = user_map(t->pml4_phys, MCUBE_FB_USER_BASE + off,
-                      info.phys + off, PTE_WRITE | PTE_PCD | PTE_NX | PTE_SHARED);
+                      info.phys + off, PTE_WRITE | PTE_PWT | PTE_NX | PTE_SHARED);
         if (rc != 0) return rc;
     }
 
@@ -912,7 +917,7 @@ static long sys_poll(u64 upfds, u64 nfds, i64 timeout_ms) {
 static long sys_time(u64 utime) {
     mcube_time_t ts;
     ts.uptime_ms = timer_uptime_ms();
-    ts.epoch = timer_boot_time_unix();
+    ts.epoch = timer_now_unix();
     ts.ticks = timer_ticks();
     if (copy_to_user((void *)(uptr)utime, &ts, sizeof(ts)) != 0) return -EFAULT;
     return 0;
@@ -948,6 +953,105 @@ static long sys_hwinfo(u64 ubuf, u64 usize) {
     if (!ubuf) return (long)sizeof(*hw);
     if (usize < sizeof(*hw)) return -EINVAL;
     if (copy_to_user((void *)(uptr)ubuf, hw, sizeof(*hw)) != 0) {
+        return -EFAULT;
+    }
+    return 0;
+}
+
+/* ---- power and network inventory ----------------------------------- */
+
+/* 0 = reboot, 1 = power off, 2 = halt. All three are terminal. */
+static long sys_power(int action) {
+    switch (action) {
+    case MCUBE_POWER_REBOOT: reboot_now(); return 0;
+    case MCUBE_POWER_OFF:    power_off(); return 0;
+    default:                 halt_forever();
+    }
+}
+
+/* Resolve a host name to an IPv4 address (host byte order). */
+static long sys_dns(u64 uname, u64 uout) {
+    char name[128];
+    if (!uname || !uout) return -EINVAL;
+
+    int n = 0;
+    for (;;) {
+        char c;
+        if (n >= (int)sizeof(name) - 1) return -ENAMETOOLONG;
+        if (copy_from_user(&c, (const void *)(uptr)(uname + (u64)n), 1) != 0)
+            return -EFAULT;
+        name[n++] = c;
+        if (c == 0) break;
+    }
+
+    u32 ip = 0;
+    int rc = net_dns_lookup(name, &ip, 3000);
+    if (rc != 0) return rc < 0 ? rc : -ETIMEDOUT;
+    if (copy_to_user((void *)(uptr)uout, &ip, sizeof(ip)) != 0) return -EFAULT;
+    return 0;
+}
+
+static long sys_netinfo(u64 ubuf) {
+    if (!ubuf) return (long)sizeof(mcube_net_info_t);
+
+    mcube_net_info_t info;
+    memset(&info, 0, sizeof(info));
+    info.ip = net_my_ip();
+    info.gateway = net_gateway();
+    info.netmask = net_netmask();
+    info.link_up = net_my_mac() ? 1 : 0;
+    const u8 *mac = net_my_mac();
+    if (mac) memcpy(info.mac, mac, ETH_ALEN);
+
+    if (copy_to_user((void *)(uptr)ubuf, &info, sizeof(info)) != 0) {
+        return -EFAULT;
+    }
+    return 0;
+}
+
+/* Power-source telemetry. ubuf == 0 queries the ABI size.
+ *
+ * The reading comes from the ACPI battery methods (_BST/_BIF/_BIX) through the
+ * minimal AML evaluator, so a machine whose firmware exposes a pack reports a
+ * real charge level. When the methods cannot be evaluated `has_percent` stays
+ * 0 and the shell draws the battery glyph without a number. */
+static long sys_battery(u64 ubuf) {
+    if (!ubuf) return (long)sizeof(mcube_battery_info_t);
+
+    mcube_battery_info_t info;
+    memset(&info, 0, sizeof(info));
+
+    acpi_battery_state_t st;
+    if (acpi_battery_read(&st) == 0) {
+        info.present = st.present;
+        info.ac_online = st.ac_online;
+        info.charging = st.charging;
+        info.has_percent = st.has_percent;
+        info.percent = st.percent;
+        info.minutes_left = st.minutes_left;
+    } else {
+        info.ac_online = 1;      /* every platform we boot has mains power */
+    }
+
+    if (copy_to_user((void *)(uptr)ubuf, &info, sizeof(info)) != 0) {
+        return -EFAULT;
+    }
+    return 0;
+}
+
+/* USB input diagnostics. ubuf == 0 queries the ABI size.
+ *
+ * A machine that boots to a desktop but answers no touch, mouse or keyboard
+ * has to be diagnosable from the screen alone: this reports what the USB core
+ * claimed, how many root ports see a device, and how many HID devices were
+ * actually bound, plus the last controller-level note. */
+static long sys_usbinfo(u64 ubuf) {
+    if (!ubuf) return (long)sizeof(mcube_usb_info_t);
+
+    mcube_usb_info_t info;
+    usb_get_info(&info);
+
+    if (copy_to_user((void *)(uptr)ubuf, &info, sizeof(info)) != 0) {
         return -EFAULT;
     }
     return 0;
@@ -1189,6 +1293,21 @@ void syscall_handler(syscall_frame_t *f) {
         break;
     case SYS_HWINFO:
         ret = sys_hwinfo(f->rdi, f->rsi);
+        break;
+    case SYS_POWER:
+        ret = sys_power((int)f->rdi);
+        break;
+    case SYS_DNS:
+        ret = sys_dns(f->rdi, f->rsi);
+        break;
+    case SYS_NETINFO:
+        ret = sys_netinfo(f->rdi);
+        break;
+    case SYS_BATTERY:
+        ret = sys_battery(f->rdi);
+        break;
+    case SYS_USBINFO:
+        ret = sys_usbinfo(f->rdi);
         break;
     case SYS_AI_CONNECT:
         ret = sys_ai_connect(f->rdi);

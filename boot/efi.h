@@ -30,6 +30,7 @@ typedef uint8_t   BOOLEAN;
 #define EFI_SUCCESS 0ULL
 #define EFI_INVALID_PARAMETER EFIERR(2)
 #define EFI_BUFFER_TOO_SMALL  EFIERR(5)
+#define EFI_OUT_OF_RESOURCES  EFIERR(9)
 #define EFI_NOT_FOUND         EFIERR(14)
 
 typedef struct {

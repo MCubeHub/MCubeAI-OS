@@ -37,6 +37,7 @@ void fb_putc(char c);
 void fb_write(const char *s);
 int  fb_get_info(mcube_fb_info_t *out);
 void fb_console_disable(void);
+void fb_console_enable(void);
 
 /* console multiplexer (serial + framebuffer) */
 void console_init(const boot_info_t *bi);
@@ -67,6 +68,7 @@ void irq_mask(u8 irq);
 /* lib/panic? boot helpers */
 NORETURN void halt_forever(void);
 void reboot_now(void);
+void power_off(void);
 
 /* Time / early timing */
 u64 timer_uptime_ms(void);

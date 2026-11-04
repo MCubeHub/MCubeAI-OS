@@ -66,6 +66,16 @@
 #define SYS_TASKINFO   0x105
 #define SYS_SPAWN      0x106
 #define SYS_HWINFO     0x107
+#define SYS_POWER      0x108
+#define SYS_DNS        0x109
+#define SYS_NETINFO    0x10A
+#define SYS_BATTERY    0x10B
+#define SYS_USBINFO    0x10C
+
+/* SYS_POWER actions. */
+#define MCUBE_POWER_REBOOT   0
+#define MCUBE_POWER_OFF      1
+#define MCUBE_POWER_HALT     2
 
 /* Socket constants mirrored from <mcube/net.h> so user programs only need
  * this header. Identical values make the duplicate definitions harmless. */
@@ -126,6 +136,58 @@ typedef struct PACKED mcube_task_info {
 } mcube_task_info_t;
 
 #define MCUBE_SIGTERM 15
+
+/* Interface status for the Settings app (SYS_NETINFO). Addresses are in host
+ * byte order so user space never has to call ntohl. */
+typedef struct PACKED mcube_net_info {
+    u32 ip;
+    u32 gateway;
+    u32 netmask;
+    u8  mac[6];
+    u8  link_up;
+    u8  pad;
+} mcube_net_info_t;
+
+/* Power source telemetry for the shell and the Power settings page.
+ *
+ * `percent` is only meaningful when `has_percent` is set. The reading is taken
+ * from the ACPI battery methods (_BST/_BIF/_BIX) via the minimal AML evaluator;
+ * a machine whose firmware only describes a pack but whose methods cannot be
+ * evaluated reports present = 1 with has_percent = 0, and the shell then draws
+ * the battery glyph without inventing a number. */
+typedef struct PACKED mcube_battery_info {
+    u8  present;      /* 1 = the firmware describes a battery pack */
+    u8  ac_online;    /* 1 = running from mains power */
+    u8  charging;     /* 1 = battery is charging */
+    u8  has_percent;  /* 1 = `percent` holds a real reading */
+    u8  percent;      /* 0..100 charge level */
+    u8  pad[3];
+    u32 minutes_left; /* estimated runtime; 0 = unknown */
+} mcube_battery_info_t;
+
+/* USB input diagnostics (SYS_USBINFO).
+ *
+ * A machine with a working display but dead touch/mouse/keyboard has to be
+ * diagnosable without a serial port, so the kernel publishes what it found:
+ * how many controllers of each type answered, how many root ports they
+ * expose, how many of those ports currently report a connected device (`ccs`)
+ * and how many HID devices were bound. `devs == 0 && ccs != 0` means the
+ * controller sees hardware but enumeration failed; `ports == 0` means no
+ * controller was claimed at all. `text` carries the last controller-level
+ * note, which is what points at the exact failing step. */
+typedef struct PACKED mcube_usb_info {
+    u32 ctrl_uhci;
+    u32 ctrl_ehci;
+    u32 ctrl_xhci;
+    u32 ports;        /* root ports across every claimed controller */
+    u32 ccs;          /* ports reporting a connected device right now */
+    u32 devs;         /* HID devices bound and polled */
+    u32 kbd;
+    u32 ptr;
+    u32 touch;
+    u32 rescans;      /* completed hot-plug passes since boot */
+    char text[96];
+} mcube_usb_info_t;
 
 #define SYS_AI_CONNECT 0x400
 #define SYS_AI_ACCEPT  0x401
