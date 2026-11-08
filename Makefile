@@ -81,7 +81,7 @@ AI_TOOLS_O := $(patsubst %.c,$(BUILD)/%.o,$(AI_TOOLS_C))
 USER_PROGS      := sh ls cat echo mkdir rm cp mv pwd sleep wc grep head tail \
                    uname true false clear env help lgyconv \
                    desktop terminal files editor calc image settings taskman \
-                   sysinfo browser slides aiosd ai faulttest
+                   sysinfo browser slides aiosd ai ftest
 USER_PROG_OBJS  := $(addprefix $(BUILD)/user/bin/,$(addsuffix .o,$(USER_PROGS)))
 USER_PROG_ELFS  := $(addprefix $(BUILD)/user/bin/,$(addsuffix .elf,$(USER_PROGS)))
 USER_PROG_LGYS  := $(addprefix $(BUILD)/user/bin/,$(addsuffix .lgy,$(USER_PROGS)))

@@ -259,8 +259,12 @@ static void unique_dest(const char *dir, const char *name, char *out, size_t cap
     for (int n = 2; n < 10; n++) {
         int keep = (int)strlen(base);
         if (keep > 7) keep = 7;       /* reserve one character for the digit */
+        /* The in-tree printf has no "%.*s" precision, so truncate by hand. */
+        char saved = base[keep];
+        base[keep] = 0;
         char stem[10];
-        snprintf(stem, sizeof(stem), "%.*s%d", keep, base, n);
+        snprintf(stem, sizeof(stem), "%s%d", base, n);
+        base[keep] = saved;
         char cand[32];
         snprintf(cand, sizeof(cand), "%s%s", stem, ext);
         join_path(out, cap, dir, cand);
