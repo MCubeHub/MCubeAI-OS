@@ -763,7 +763,12 @@ int net_dns_lookup(const char *name, u32 *ip_out, u32 timeout_ms) {
             net_socket_close(s);
             return rc;
         }
-        timer_sleep_ms(1);
+        /* sys_dns() runs with IF=0 (the syscall gate masks interrupts), so
+         * timer_sleep_ms() would hlt with no wakeup and freeze the machine.
+         * Yield through the scheduler instead; during the boot self-test the
+         * scheduler is not active yet and task_sleep_ms() falls back to the
+         * PIT busy wait. */
+        task_sleep_ms(1);
     }
 
     net_socket_close(s);
