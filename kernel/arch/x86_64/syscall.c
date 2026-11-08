@@ -665,6 +665,15 @@ static long sys_execve(u64 upath, u64 uargv, u64 uenvp, syscall_frame_t *f) {
     task_t *t = current_task();
     u64 old_as = t->pml4_phys;
 
+    /* exec keeps the same task, so its name has to be refreshed here. Without
+     * this every program the shell starts stays "init" in Task Manager and in
+     * fault reports, which makes a crash impossible to attribute. */
+    const char *name = r.path;
+    for (const char *p = r.path; *p; p++)
+        if (*p == '/') name = p + 1;
+    strncpy(t->name, name, sizeof(t->name) - 1);
+    t->name[sizeof(t->name) - 1] = 0;
+
     t->pml4_phys = r.new_as;
     t->user_entry = r.entry;
     t->user_stack_top = USER_STACK_TOP;
