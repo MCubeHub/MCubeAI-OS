@@ -239,12 +239,14 @@ static int remove_any(const char *path, int depth) {
     return rmdir(path) == 0 ? 0 : -1;
 }
 
-/* Windows-style conflict handling: "RINGS.BMP" becomes "RINGS (2).BMP". */
+/* Windows-style conflict handling, but kept 8.3: the FAT32 driver can only
+ * create short names (no LFN writer yet), so "SUNSET.PNG" becomes
+ * "SUNSET2.PNG" instead of "SUNSET (2).PNG". */
 static void unique_dest(const char *dir, const char *name, char *out, size_t cap) {
     join_path(out, cap, dir, name);
     if (!entry_exists(out)) return;
 
-    char base[64], ext[16];
+    char base[16], ext[8];
     snprintf(base, sizeof(base), "%s", name);
     char *dot = strrchr(base, '.');
     if (dot && dot != base) {
@@ -254,9 +256,13 @@ static void unique_dest(const char *dir, const char *name, char *out, size_t cap
         ext[0] = 0;
     }
 
-    for (int n = 2; n < 1000; n++) {
-        char cand[96];
-        snprintf(cand, sizeof(cand), "%s (%d)%s", base, n, ext);
+    for (int n = 2; n < 10; n++) {
+        int keep = (int)strlen(base);
+        if (keep > 7) keep = 7;       /* reserve one character for the digit */
+        char stem[10];
+        snprintf(stem, sizeof(stem), "%.*s%d", keep, base, n);
+        char cand[32];
+        snprintf(cand, sizeof(cand), "%s%s", stem, ext);
         join_path(out, cap, dir, cand);
         if (!entry_exists(out)) return;
     }
