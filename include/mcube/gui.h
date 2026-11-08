@@ -51,6 +51,15 @@
 #define GUI_EVT_CLOSE   5
 #define GUI_EVT_TICK    6
 
+/* Modifier state carried in gui_event.buttons for GUI_EVT_KEY. The desktop
+ * consumes the standalone modifier press/release events for its own chords,
+ * so an application would otherwise never learn that Ctrl is held. The bit
+ * values are identical to the shell's internal MOD_* mask. */
+#define GUI_MOD_SHIFT 0x01u
+#define GUI_MOD_CTRL  0x02u
+#define GUI_MOD_ALT   0x04u
+#define GUI_MOD_WIN   0x08u
+
 typedef struct PACKED gui_cmd {
     u32 type;
     i32 x, y, w, h;

@@ -7,6 +7,7 @@
 #include <mcube/io.h>
 #include <mcube/mm.h>
 #include <mcube/timer.h>
+#include <mcube/sched.h>
 
 #define IDT_ENTRIES 256
 #define IRQ_BASE 0x20
@@ -164,6 +165,22 @@ void isr_handler(isr_frame_t *f) {
                     (f->error & 4) ? "user " : "kernel ",
                     (f->error & 8) ? "reserved-bit " : "",
                     (f->error & 16) ? "instruction-fetch" : "");
+        }
+
+        /* CS.RPL == 3 means the fault came from an application, not from the
+         * kernel. Windows keeps the machine alive in that case and only the
+         * offending process dies; a desktop OS must do the same, otherwise one
+         * bad app turns the whole session into a debugger prompt. The desktop
+         * already tears a window down when the app's command pipe goes away,
+         * so killing the task is all the kernel has to do here. Status
+         * 128 + SIGSEGV mirrors what a shell reports for a crashed child. */
+        if (f->cs & 3) {
+            task_t *t = current_task();
+            if (t) {
+                kprintf("[fault] user task '%s' (pid %u) killed, vector %u\n",
+                        t->name, (u32)t->pid, (u32)f->vector);
+                task_kill(t->pid, 128 + 11);
+            }
         }
         panic("unhandled CPU exception");
     }

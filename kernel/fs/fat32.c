@@ -728,6 +728,13 @@ int fat32_readdir(fat32_fs_t *fs, const fat32_node_t *dir, u32 index,
             if (de->name[0] == 0xE5) continue;
             if (de->attr == ATTR_LFN) continue;
             if (de->attr & ATTR_VOL) continue;
+            /* "." and ".." are ordinary entries on FAT32, but every caller of
+             * readdir treats this as a content listing. Hiding them keeps the
+             * explorer clean and stops a recursive copy from walking into the
+             * parent directory forever. */
+            if (de->name[0] == '.' &&
+                (de->name[1] == ' ' || (de->name[1] == '.' && de->name[2] == ' ')))
+                continue;
 
             if (ordinal == index) {
                 memset(out, 0, sizeof(*out));

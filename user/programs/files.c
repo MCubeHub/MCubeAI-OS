@@ -110,6 +110,23 @@ static int  g_addr_len;
 static int g_last_idx = -1;
 static u64 g_last_ms;
 
+/* ---- file clipboard (Ctrl+C / Ctrl+X / Ctrl+V) ---------------------- */
+
+/* One path is remembered, matching the single-selection model of the list.
+ * A cut only removes the source after the copy has succeeded, so a failed
+ * paste never destroys the original. */
+#define FC_PATH 320
+static char g_fc_path[FC_PATH];
+static int  g_fc_have;
+static int  g_fc_cut;
+
+/* Small modal used by Delete: 0 = none, 1 = waiting for confirmation. */
+static int  g_prompt;
+static char g_prompt_name[64];
+
+/* Defined further down; the clipboard helpers reload the folder. */
+static void load_dir(const char *path);
+
 static const char *const g_nav_label[] = { "Home", "Bin", "Docs", "Models", "Pictures" };
 static const char *const g_nav_path[]  = { "/", "/bin", "/docs", "/models", "/pictures" };
 #define NAV_COUNT ((int)(sizeof(g_nav_path) / sizeof(g_nav_path[0])))
@@ -132,6 +149,183 @@ static void human_size(u64 n, char *out, size_t cap) {
     if (n < 1024) snprintf(out, cap, "%llu B", (unsigned long long)n);
     else if (n < 1024u * 1024u) snprintf(out, cap, "%llu KB", (unsigned long long)((n + 512) / 1024));
     else snprintf(out, cap, "%llu MB", (unsigned long long)((n + 512u * 1024u) / (1024u * 1024u)));
+}
+
+/* ---- file operations ------------------------------------------------ */
+
+static int entry_exists(const char *path) {
+    mcube_stat_t st;
+    return stat(path, &st) == 0;
+}
+
+static int dot_entry(const char *name) {
+    return name[0] == '.' && (name[1] == 0 || (name[1] == '.' && name[2] == 0));
+}
+
+/* The FAT driver now hides "." and "..", but the checks stay here as well:
+ * a future backend must not be able to turn a copy into a parent loop. */
+static int copy_file_bytes(const char *src, const char *dst) {
+    int in = open(src, VFS_O_RDONLY);
+    if (in < 0) return -1;
+    int out = open(dst, VFS_O_WRONLY | VFS_O_CREAT | VFS_O_TRUNC);
+    if (out < 0) { close(in); return -1; }
+
+    static char buf[4096];   /* static: user stacks are small */
+    int ok = 1;
+    for (;;) {
+        long n = read(in, buf, sizeof(buf));
+        if (n < 0) { ok = 0; break; }
+        if (n == 0) break;
+        long off = 0;
+        while (off < n) {
+            long w = write(out, buf + off, (size_t)(n - off));
+            if (w <= 0) { ok = 0; break; }
+            off += w;
+        }
+        if (!ok) break;
+    }
+
+    close(out);
+    close(in);
+    return ok ? 0 : -1;
+}
+
+static int copy_any(const char *src, const char *dst, int depth) {
+    if (depth > 8) return -1;
+
+    mcube_stat_t st;
+    if (stat(src, &st) != 0) return -1;
+    if (st.type != VFS_TYPE_DIR) return copy_file_bytes(src, dst);
+
+    if (!entry_exists(dst) && mkdir(dst, 0) != 0) return -1;
+
+    for (int i = 0; ; i++) {
+        mcube_dirent_t de;
+        if (mc_readdir(src, i, &de) != 0) break;
+        if (dot_entry(de.name)) continue;
+
+        char cs[FC_PATH], cd[FC_PATH];
+        join_path(cs, sizeof(cs), src, de.name);
+        join_path(cd, sizeof(cd), dst, de.name);
+        if (copy_any(cs, cd, depth + 1) != 0) return -1;
+    }
+    return 0;
+}
+
+static int remove_any(const char *path, int depth) {
+    if (depth > 8) return -1;
+
+    mcube_stat_t st;
+    if (stat(path, &st) != 0) return -1;
+    if (st.type != VFS_TYPE_DIR) return unlink(path) == 0 ? 0 : -1;
+
+    /* Re-read index 0 after every delete: the entries shift down, so a fixed
+     * index would skip every second child. */
+    for (;;) {
+        mcube_dirent_t de;
+        int found = 0;
+        for (int i = 0; ; i++) {
+            if (mc_readdir(path, i, &de) != 0) break;
+            if (dot_entry(de.name)) continue;
+            found = 1;
+            break;
+        }
+        if (!found) break;
+
+        char child[FC_PATH];
+        join_path(child, sizeof(child), path, de.name);
+        if (remove_any(child, depth + 1) != 0) return -1;
+    }
+    return rmdir(path) == 0 ? 0 : -1;
+}
+
+/* Windows-style conflict handling: "RINGS.BMP" becomes "RINGS (2).BMP". */
+static void unique_dest(const char *dir, const char *name, char *out, size_t cap) {
+    join_path(out, cap, dir, name);
+    if (!entry_exists(out)) return;
+
+    char base[64], ext[16];
+    snprintf(base, sizeof(base), "%s", name);
+    char *dot = strrchr(base, '.');
+    if (dot && dot != base) {
+        snprintf(ext, sizeof(ext), "%s", dot);
+        dot[0] = 0;
+    } else {
+        ext[0] = 0;
+    }
+
+    for (int n = 2; n < 1000; n++) {
+        char cand[96];
+        snprintf(cand, sizeof(cand), "%s (%d)%s", base, n, ext);
+        join_path(out, cap, dir, cand);
+        if (!entry_exists(out)) return;
+    }
+}
+
+static void clip_copy(int cut) {
+    if (g_sel < 0 || g_sel >= g_count) {
+        status("Select a file or folder first");
+        return;
+    }
+    join_path(g_fc_path, sizeof(g_fc_path), g_cwd, g_entries[g_sel].name);
+    g_fc_have = 1;
+    g_fc_cut = cut;
+
+    char msg[120];
+    snprintf(msg, sizeof(msg), "%s: %s", cut ? "Cut" : "Copied",
+             g_entries[g_sel].name);
+    status(msg);
+}
+
+static void clip_paste(void) {
+    if (!g_fc_have) {
+        status("Clipboard is empty");
+        return;
+    }
+
+    const char *name = strrchr(g_fc_path, '/');
+    name = name ? name + 1 : g_fc_path;
+
+    char dst[FC_PATH];
+    unique_dest(g_cwd, name, dst, sizeof(dst));
+
+    int was_cut = g_fc_cut;
+    int copied = copy_any(g_fc_path, dst, 0) == 0;
+    int removed = 0;
+    if (copied && was_cut) {
+        removed = remove_any(g_fc_path, 0) == 0;
+        if (removed) { g_fc_have = 0; g_fc_cut = 0; }
+    }
+
+    load_dir(g_cwd);
+    if (!copied) status("Paste failed");
+    else if (was_cut && !removed) status("Moved, but the source could not be removed");
+    else status(was_cut ? "Moved" : "Pasted a copy");
+}
+
+static void delete_request(void) {
+    if (g_sel < 0 || g_sel >= g_count) {
+        status("Select a file or folder first");
+        return;
+    }
+    snprintf(g_prompt_name, sizeof(g_prompt_name), "%s", g_entries[g_sel].name);
+    g_prompt = 1;
+    g_need = 1;
+}
+
+static void delete_commit(void) {
+    char full[FC_PATH];
+    join_path(full, sizeof(full), g_cwd, g_prompt_name);
+
+    int ok = remove_any(full, 0) == 0;
+    if (g_fc_have && strcmp(g_fc_path, full) == 0) {
+        g_fc_have = 0;
+        g_fc_cut = 0;
+    }
+
+    g_prompt = 0;
+    load_dir(g_cwd);
+    status(ok ? "Deleted" : "Delete failed");
 }
 
 static void fill_frame(int x, int y, int w, int h, u32 fill, u32 border) {
@@ -755,6 +949,24 @@ static void draw_status(int w, int h) {
     if (rx > 8 + text_w(left) + 12) gui_text(rx, y + 4, C_DIM, right);
 }
 
+/* Modal confirmation for Delete. The dialog is drawn last so it covers both
+ * the list and the thumbnail grid; no mouse hit testing runs while it is open. */
+static void draw_prompt(int w, int h) {
+    if (!g_prompt) return;
+
+    int bw = 420, bh = 118;
+    int x = (w - bw) / 2, y = (h - bh) / 2;
+
+    gui_fill(x + 4, y + 4, bw, bh, 0x0A0D12);
+    fill_frame(x, y, bw, bh, 0x1E2430, C_BORDER);
+    gui_text(x + 16, y + 14, C_TEXT, "Delete this item?");
+    char line[96];
+    snprintf(line, sizeof(line), "%s", g_prompt_name);
+    gui_text(x + 16, y + 38, C_ACCENT, line);
+    gui_text(x + 16, y + 76, C_DIM, "Enter  Delete");
+    gui_text(x + 140, y + 76, C_DIM, "Esc   Cancel");
+}
+
 static void draw(void) {
     int w = gui_width(), h = gui_height();
     layout_view();
@@ -766,6 +978,7 @@ static void draw(void) {
     else draw_list(w, h);
     draw_scrollbar(w, h);
     draw_status(w, h);
+    draw_prompt(w, h);
     gui_flush();
     /* Keep the pending flag so the next loop iteration decodes the rest of the
      * visible thumbnails; clearing it here would strand the placeholders. */
@@ -848,7 +1061,17 @@ static void commit_address(void) {
     else g_need = 1;
 }
 
-static void key_event(u32 c) {
+static void key_event(u32 c, u32 mods) {
+    /* Release events only matter for modifier bookkeeping, which the desktop
+     * already folds into mods, so nothing else here consumes them. */
+    if (c & INPUT_KEY_RELEASE) return;
+
+    if (g_prompt) {
+        if (c == '\n') delete_commit();
+        else if (c == 27) { g_prompt = 0; status("Delete cancelled"); }
+        return;
+    }
+
     if (g_addr_edit) {
         if (c == '\n') {
             commit_address();
@@ -864,6 +1087,12 @@ static void key_event(u32 c) {
             g_need = 1;
         }
         return;
+    }
+
+    if (mods & GUI_MOD_CTRL) {
+        if (c == 'c' || c == 'C') { clip_copy(0); return; }
+        if (c == 'x' || c == 'X') { clip_copy(1); return; }
+        if (c == 'v' || c == 'V') { clip_paste(); return; }
     }
 
     if (c == INPUT_KEY_UP) {
@@ -890,6 +1119,8 @@ static void key_event(u32 c) {
         load_dir(g_cwd);
     } else if (c == INPUT_KEY_F3) {
         toggle_view();
+    } else if (c == INPUT_KEY_DELETE) {
+        delete_request();
     } else if (c == INPUT_KEY_F2) {
         begin_address_edit();
     } else if (c >= 32 && c < 0x100) {
@@ -909,6 +1140,7 @@ static void key_event(u32 c) {
 
 static void mouse_press(int x, int y, u32 buttons) {
     if (!(buttons & 1)) return;
+    if (g_prompt) return;      /* the confirmation dialog is keyboard only */
 
     int w = gui_width(), h = gui_height();
 
@@ -972,7 +1204,7 @@ static void mouse_release(u32 buttons) {
 static void handle_event(const gui_event_t *ev) {
     switch (ev->type) {
     case GUI_EVT_KEY:
-        if (!(ev->code & INPUT_KEY_RELEASE)) key_event(ev->code);
+        key_event(ev->code, ev->buttons);
         break;
 
     case GUI_EVT_MOUSE:

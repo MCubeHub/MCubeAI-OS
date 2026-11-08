@@ -4718,7 +4718,10 @@ static void handle_key(u32 raw) {
 
     if (g_focus >= 0 && g_focus < MAX_WINS && g_wins[g_focus].used &&
         !g_wins[g_focus].minimized) {
-        send_event(g_focus, GUI_EVT_KEY, code, 0, 0, 0, 0, 0, 0, 0);
+        /* The shell swallows the modifier key events themselves, so ship the
+         * current mask along with every forwarded key. Applications need it
+         * for Ctrl+C / Ctrl+V style shortcuts. */
+        send_event(g_focus, GUI_EVT_KEY, code, 0, 0, 0, 0, g_mods, 0, 0);
     }
 }
 
