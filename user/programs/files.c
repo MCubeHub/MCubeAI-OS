@@ -287,6 +287,16 @@ static void clip_copy(int cut) {
     status(msg);
 }
 
+static void select_name(const char *name) {
+    for (int i = 0; i < g_count; i++) {
+        if (strcmp(g_entries[i].name, name) == 0) {
+            g_sel = i;
+            g_need = 1;
+            return;
+        }
+    }
+}
+
 static void clip_paste(void) {
     if (!g_fc_have) {
         status("Clipboard is empty");
@@ -307,7 +317,11 @@ static void clip_paste(void) {
         if (removed) { g_fc_have = 0; g_fc_cut = 0; }
     }
 
+    const char *dst_name = strrchr(dst, '/');
+    dst_name = dst_name ? dst_name + 1 : dst;
+
     load_dir(g_cwd);
+    if (copied) select_name(dst_name);
     if (!copied) status("Paste failed");
     else if (was_cut && !removed) status("Moved, but the source could not be removed");
     else status(was_cut ? "Moved" : "Pasted a copy");
