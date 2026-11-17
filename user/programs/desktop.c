@@ -688,6 +688,189 @@ static void gfx_text_bold(u32 *buf, int stride, int bw, int bh,
     gfx_text_tab(buf, stride, bw, bh, x, y, rgb, s, n, mc_ui_font_bold);
 }
 
+/* ---- system input method (pinyin) ------------------------------------ */
+
+/* The shell owns the IME so every application gets Chinese input without
+ * knowing anything about it: keys are composed here, and the finished UTF-8
+ * text arrives as a GUI_EVT_TEXT event. Ctrl+Space toggles Chinese mode. */
+
+#define IME_MAX_CAND 9
+#define IME_BUF_MAX  32
+
+static int  g_ime_on;            /* Chinese mode enabled */
+static int  g_ime_len;           /* letters in the pinyin buffer */
+static int  g_ime_sel;           /* highlighted candidate */
+static int  g_ime_count;
+static char g_ime_buf[IME_BUF_MAX];
+static char g_ime_cand[IME_MAX_CAND][48];
+
+static void send_text_event(int slot, const char *text);
+
+static int ime_text_w(const char *s) {
+    int w = 0;
+    for (int i = 0; s && s[i]; ) {
+        if ((u8)s[i] < 0x80) { w += 8; i++; }
+        else { w += 16; i += 3; }
+    }
+    return w;
+}
+
+static void ime_add_cand(const char *text) {
+    if (!text || !*text || g_ime_count >= IME_MAX_CAND) return;
+    for (int i = 0; i < g_ime_count; i++)
+        if (strcmp(g_ime_cand[i], text) == 0) return;
+    snprintf(g_ime_cand[g_ime_count], sizeof(g_ime_cand[0]), "%s", text);
+    g_ime_count++;
+}
+
+/* Greedy longest-syllable split, then the most common character per syllable.
+ * This is what turns "nihao" into 你好 when the word is not in the table. */
+static int ime_syllable_split(char *out, int cap) {
+    int n = g_ime_len;
+    int pos = 0, used = 0;
+    out[0] = 0;
+
+    while (pos < n) {
+        int best = 0;
+        const char *best_py = 0;
+        int nsyl = (int)(sizeof(ime_syllables) / sizeof(ime_syllables[0]));
+        for (int i = 0; i < nsyl; i++) {
+            const char *py = ime_syllables[i];
+            int len = (int)strlen(py);
+            if (len <= best || pos + len > n) continue;
+            if (memcmp(g_ime_buf + pos, py, (size_t)len) != 0) continue;
+            best = len;
+            best_py = py;
+        }
+        if (!best) return 0;
+
+        const char *text = 0;
+        int ne = (int)(sizeof(ime_entries) / sizeof(ime_entries[0]));
+        for (int i = 0; i < ne; i++) {
+            if (strcmp(ime_entries[i].py, best_py) == 0) {
+                text = ime_entries[i].text;
+                break;
+            }
+        }
+        if (!text) return 0;
+
+        int tl = (int)strlen(text);
+        if (used + tl >= cap) break;
+        memcpy(out + used, text, (size_t)tl);
+        used += tl;
+        out[used] = 0;
+        pos += best;
+    }
+    return pos == n && used > 0;
+}
+
+static void ime_update(void) {
+    g_ime_count = 0;
+    g_ime_sel = 0;
+    if (g_ime_len == 0) return;
+
+    int ne = (int)(sizeof(ime_entries) / sizeof(ime_entries[0]));
+
+    /* Exact words and characters first, in frequency order. */
+    for (int i = 0; i < ne && g_ime_count < IME_MAX_CAND; i++)
+        if (strcmp(ime_entries[i].py, g_ime_buf) == 0)
+            ime_add_cand(ime_entries[i].text);
+
+    /* Then completions, so typing "zh" already shows 中 这 只 ... */
+    for (int i = 0; i < ne && g_ime_count < IME_MAX_CAND; i++) {
+        if (strncmp(ime_entries[i].py, g_ime_buf, (size_t)g_ime_len) == 0 &&
+            ime_entries[i].py[g_ime_len] != 0)
+            ime_add_cand(ime_entries[i].text);
+    }
+
+    char comb[48];
+    if (g_ime_count < IME_MAX_CAND && g_ime_len >= 2 &&
+        ime_syllable_split(comb, (int)sizeof(comb)))
+        ime_add_cand(comb);
+}
+
+static void ime_reset(void) {
+    g_ime_len = 0;
+    g_ime_sel = 0;
+    g_ime_count = 0;
+    g_ime_buf[0] = 0;
+}
+
+static void ime_commit(int idx) {
+    if (idx >= 0 && idx < g_ime_count) send_text_event(g_focus, g_ime_cand[idx]);
+    else send_text_event(g_focus, g_ime_buf);   /* no match: raw pinyin */
+    ime_reset();
+    g_need_compose = 1;
+}
+
+static void ime_toggle(void) {
+    g_ime_on = !g_ime_on;
+    ime_reset();
+    g_need_compose = 1;
+}
+
+/* Returns 1 when the key belongs to the IME and must not reach the app. */
+static int ime_key(u32 code) {
+    if (!g_ime_on) return 0;
+
+    u32 c = code;
+    if (c >= 'A' && c <= 'Z') c = c - 'A' + 'a';
+
+    if (c >= 'a' && c <= 'z') {
+        if (g_ime_len < IME_BUF_MAX - 1) {
+            g_ime_buf[g_ime_len++] = (char)c;
+            g_ime_buf[g_ime_len] = 0;
+            ime_update();
+            g_need_compose = 1;
+        }
+        return 1;
+    }
+    if (c == '\'') return 1;      /* syllable separator, not part of the key */
+
+    if (g_ime_len == 0) return 0;
+
+    switch (c) {
+    case '\b':
+        g_ime_buf[--g_ime_len] = 0;
+        ime_update();
+        g_need_compose = 1;
+        return 1;
+    case 27:
+        ime_reset();
+        g_need_compose = 1;
+        return 1;
+    case ' ':
+    case '\n':
+        ime_commit(g_ime_sel);
+        return 1;
+    case INPUT_KEY_LEFT:
+        if (g_ime_sel > 0) g_ime_sel--;
+        g_need_compose = 1;
+        return 1;
+    case INPUT_KEY_RIGHT:
+        if (g_ime_sel + 1 < g_ime_count) g_ime_sel++;
+        g_need_compose = 1;
+        return 1;
+    default:
+        break;
+    }
+
+    if (c >= '1' && c <= '9') {
+        int idx = (int)(c - '1');
+        if (idx < g_ime_count) ime_commit(idx);
+        return 1;
+    }
+
+    /* Any other printable key ends composition and goes to the app, so a
+     * punctuation mark is not swallowed by a half-finished syllable. */
+    if (c >= 32 && c < 0x100) {
+        ime_reset();
+        g_need_compose = 1;
+        return 0;
+    }
+    return 0;
+}
+
 static int isqrt_i(int v) {
     if (v <= 0) return 0;
     int r = 0;
@@ -1373,6 +1556,25 @@ static void send_event(int slot, u32 type, u32 code, int x, int y,
     if (win->pend_evt && !(type == GUI_EVT_MOUSE && win->pend.type == GUI_EVT_MOUSE)) {
         return;
     }
+    win->pend = ev;
+    win->pend_evt = 1;
+}
+
+/* Composed IME text. It travels as a normal event and uses the same parking
+ * slot, so a momentarily full pipe delays the text instead of losing it. */
+static void send_text_event(int slot, const char *text) {
+    if (slot < 0 || slot >= MAX_WINS || !text) return;
+    win_t *win = &g_wins[slot];
+    if (!win->used || win->evt_fd < 0) return;
+
+    gui_event_t ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.type = GUI_EVT_TEXT;
+    strncpy(ev.text, text, sizeof(ev.text) - 1);
+    ev.text[sizeof(ev.text) - 1] = 0;
+
+    if (write_nb(win->evt_fd, &ev, sizeof(ev)) == (ssize_t)sizeof(ev)) return;
+    if (win->pend_evt) return;
     win->pend = ev;
     win->pend_evt = 1;
 }
@@ -3295,6 +3497,62 @@ static void draw_switcher(void) {
 
 /* ---- composition ----------------------------------------------------- */
 
+/* IME overlay. While a syllable is being composed it floats above the taskbar
+ * as a candidate bar; with Chinese mode on but nothing typed, a small CN badge
+ * in the bottom-right corner shows the mode is active. */
+static void draw_ime(void) {
+    if (!g_ime_on && g_ime_len == 0) return;
+
+    int fbw = g_fbw;
+    int fbh = g_fbh;
+
+    if (g_ime_len == 0) {
+        int bw = 46, bh = 26;
+        int x = fbw - bw - 16;
+        int y = work_h() - bh - 10;
+        gfx_fill(g_fb, g_stride, fbw, fbh, x, y, bw, bh, 0x14203A);
+        gfx_rect(g_fb, g_stride, fbw, fbh, x, y, bw, bh, g_accent);
+        gfx_text(g_fb, g_stride, fbw, fbh, x + 7, y + 5, C_TEXT, "CN", 2);
+        return;
+    }
+
+    int pinyin_w = g_ime_len * 8;
+    int item_w[IME_MAX_CAND];
+    int w = 12 + pinyin_w + 14;
+    for (int i = 0; i < g_ime_count; i++) {
+        item_w[i] = 10 + 8 + 6 + ime_text_w(g_ime_cand[i]) + 10;
+        w += item_w[i];
+    }
+    int maxw = fbw - 24;
+    if (w > maxw) w = maxw;
+
+    int h = 40;
+    int x = (fbw - w) / 2;
+    if (x < 12) x = 12;
+    int y = work_h() - h - 10;
+
+    gfx_fill(g_fb, g_stride, fbw, fbh, x, y, w, h, 0x101A2C);
+    gfx_rect(g_fb, g_stride, fbw, fbh, x, y, w, h, g_accent);
+    gfx_text(g_fb, g_stride, fbw, fbh, x + 12, y + 12, 0x93A2B8,
+             g_ime_buf, g_ime_len);
+
+    int px = x + 12 + pinyin_w + 14;
+    for (int i = 0; i < g_ime_count && px + 20 < x + w; i++) {
+        int sel = (i == g_ime_sel);
+        if (sel)
+            gfx_fill(g_fb, g_stride, fbw, fbh, px, y + 7, item_w[i], h - 14,
+                     g_accent_dark);
+
+        char num[4];
+        snprintf(num, sizeof(num), "%d", i + 1);
+        gfx_text(g_fb, g_stride, fbw, fbh, px + 6, y + 12,
+                 sel ? 0xFFFFFF : 0x9FB0C8, num, -1);
+        gfx_text(g_fb, g_stride, fbw, fbh, px + 6 + 14, y + 12,
+                 sel ? 0xFFFFFF : C_TEXT, g_ime_cand[i], -1);
+        px += item_w[i];
+    }
+}
+
 /* Repaint the whole scene and copy it out to video memory. px/py/pw/ph bound
  * the rectangle that actually has to reach the screen. */
 static void compose(int px, int py, int pw, int ph) {
@@ -3315,6 +3573,7 @@ static void compose(int px, int py, int pw, int ph) {
     if (g_menu_open) draw_menu();
     if (g_switcher_open) draw_switcher();
     draw_taskbar_popups();
+    draw_ime();
     cursor_draw();
 
     pres_add(px, py, pw, ph);
@@ -4698,6 +4957,11 @@ static void handle_key(u32 raw) {
 
     if (!down) return;
 
+    /* Ctrl+Space toggles the system IME, like every desktop OS. */
+    if ((g_mods & MOD_CTRL) && code == ' ') {
+        ime_toggle();
+        return;
+    }
     /* Escape backs out of the shell-level popups before a focused app sees it. */
     if (code == 27) {
         if (g_snap_open) {
@@ -4818,6 +5082,10 @@ static void handle_key(u32 raw) {
     /* Alt and Win chords belong to the shell; Ctrl chords pass through so
      * applications can implement their own shortcuts (browser tabs, editing). */
     if (g_mods & (MOD_ALT | MOD_WIN)) return;
+
+    /* A key that belongs to a pinyin composition never reaches the app; the
+     * finished text comes back as GUI_EVT_TEXT after a candidate is chosen. */
+    if (ime_key(code)) return;
 
     if (g_focus >= 0 && g_focus < MAX_WINS && g_wins[g_focus].used &&
         !g_wins[g_focus].minimized) {

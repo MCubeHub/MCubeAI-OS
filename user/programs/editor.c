@@ -83,6 +83,66 @@ static void set_msg(const char *s) {
 static int min_i(int a, int b) { return a < b ? a : b; }
 static int max_i(int a, int b) { return a > b ? a : b; }
 
+/* ---- UTF-8 helpers -------------------------------------------------- */
+
+/* The buffer is bytes, but the caret and the layout work on whole characters
+ * so an IME syllable behaves like one key press: it is inserted, moved over
+ * and deleted as a unit. */
+
+static int utf8_seq_len(u8 c) {
+    if (c < 0x80) return 1;
+    if ((c & 0xE0) == 0xC0) return 2;
+    if ((c & 0xF0) == 0xE0) return 3;
+    if ((c & 0xF8) == 0xF0) return 4;
+    return 1;
+}
+
+static int prev_char(int i) {
+    if (i <= 0) return 0;
+    i--;
+    while (i > 0 && ((u8)g_buf[i] & 0xC0) == 0x80) i--;
+    return i;
+}
+
+static int next_char(int i) {
+    if (i >= g_len) return g_len;
+    i += utf8_seq_len((u8)g_buf[i]);
+    if (i > g_len) i = g_len;
+    return i;
+}
+
+/* Terminal cells: a double-byte character occupies two 8 px columns. */
+static int char_cols(int i) {
+    int n = utf8_seq_len((u8)g_buf[i]);
+    return n >= 3 ? 2 : 1;
+}
+
+static int cols_between(int from, int to) {
+    int col = 0;
+    if (from < 0) from = 0;
+    if (to > g_len) to = g_len;
+    for (int i = from; i < to; ) {
+        int n = utf8_seq_len((u8)g_buf[i]);
+        if (i + n > to) break;
+        col += char_cols(i);
+        i += n;
+    }
+    return col;
+}
+
+/* Byte offset of display column `col` inside the visual line at `start`. */
+static int col_to_off(int start, int col) {
+    int i = start;
+    int c = 0;
+    while (i < g_len && g_buf[i] != '\n') {
+        int w = char_cols(i);
+        if (c + w > col) break;
+        c += w;
+        i += utf8_seq_len((u8)g_buf[i]);
+    }
+    return i;
+}
+
 static void sel_range(int *lo, int *hi) {
     if (g_sel_a < 0) {
         *lo = *hi = g_off;
@@ -99,8 +159,7 @@ static void caret_lc(int *line, int *col) {
         else break;
     }
     *line = v;
-    *col = g_off - g_vpos[v];
-    if (*col < 0) *col = 0;
+    *col = cols_between(g_vpos[v], g_off);
 }
 
 /* ---- layout --------------------------------------------------------- */
@@ -120,9 +179,14 @@ static void layout(int cols) {
         int start = i;
         int stop;
         if (g_wrap) {
-            int limit = start + g_vcols;
+            int cols = 0;
             stop = start;
-            while (stop < g_len && g_buf[stop] != '\n' && stop < limit) stop++;
+            while (stop < g_len && g_buf[stop] != '\n') {
+                int w = char_cols(stop);
+                if (cols + w > g_vcols) break;
+                cols += w;
+                stop += utf8_seq_len((u8)g_buf[stop]);
+            }
             /* Prefer to break on a space rather than mid-word. */
             if (stop < g_len && g_buf[stop] != '\n' && stop > start) {
                 int brk = stop;
@@ -249,15 +313,35 @@ static void insert_char(char c) {
     g_need = 1;
 }
 
+/* Insert a complete UTF-8 sequence (an IME commit) without ever splitting it. */
+static void insert_utf8(const char *s) {
+    if (!s || !*s) return;
+    delete_selection();
+
+    int n = (int)strlen(s);
+    if (g_len + n > EDIT_MAX) {
+        set_msg("Buffer full");
+        return;
+    }
+    memmove(g_buf + g_off + n, g_buf + g_off, (size_t)(g_len - g_off));
+    memcpy(g_buf + g_off, s, (size_t)n);
+    g_off += n;
+    g_len += n;
+    g_buf[g_len] = 0;
+    g_dirty = 1;
+    g_need = 1;
+}
+
 static void backspace(void) {
     if (g_sel_a >= 0 && g_sel_a != g_off) {
         delete_selection();
         return;
     }
     if (g_off <= 0) return;
-    memmove(g_buf + g_off - 1, g_buf + g_off, (size_t)(g_len - g_off));
-    g_off--;
-    g_len--;
+    int start = prev_char(g_off);
+    memmove(g_buf + start, g_buf + g_off, (size_t)(g_len - g_off));
+    g_len -= g_off - start;
+    g_off = start;
     g_dirty = 1;
     g_need = 1;
 }
@@ -268,8 +352,9 @@ static void delete_forward(void) {
         return;
     }
     if (g_off >= g_len) return;
-    memmove(g_buf + g_off, g_buf + g_off + 1, (size_t)(g_len - g_off - 1));
-    g_len--;
+    int end = next_char(g_off);
+    memmove(g_buf + g_off, g_buf + end, (size_t)(g_len - end));
+    g_len -= end - g_off;
     g_dirty = 1;
     g_need = 1;
 }
@@ -291,8 +376,7 @@ static void move_vertical(int dir) {
     caret_lc(&line, &col);
     int target = line + dir;
     if (target < 0 || target >= g_vcount) return;
-    if (col > g_vlen[target]) col = g_vlen[target];
-    move_caret(g_vpos[target] + col);
+    move_caret(col_to_off(g_vpos[target], col));
 }
 
 static void move_home(void) {
@@ -422,17 +506,21 @@ static void draw_text_area(int w, int h) {
         int len = g_vlen[v];
         if (len > 0) gui_textn(PAD_X, y + 1, C_TEXT, g_buf + pos, len);
 
-        /* Highlight the part of this visual line that is selected. */
+        /* Highlight the part of this visual line that is selected. Offsets are
+         * converted to display columns so a Chinese character is two cells. */
         if (hi > lo) {
             int a = max_i(lo, pos);
             int b = min_i(hi, pos + len);
             if (b > a) {
-                gui_fill(PAD_X + (a - pos) * 8, y, (b - a) * 8, ROW_H, C_SEL);
-                gui_textn(PAD_X + (a - pos) * 8, y + 1, C_TEXT, g_buf + a, b - a);
+                int ca = cols_between(pos, a);
+                int cb = cols_between(pos, b);
+                gui_fill(PAD_X + ca * 8, y, (cb - ca) * 8, ROW_H, C_SEL);
+                gui_textn(PAD_X + ca * 8, y + 1, C_TEXT, g_buf + a, b - a);
             }
             /* A selection that runs past this line also covers its break. */
             if (hi > pos + len && lo <= pos + len) {
-                gui_fill(PAD_X + len * 8, y, 6, ROW_H, C_SEL);
+                int ct = cols_between(pos, pos + len);
+                gui_fill(PAD_X + ct * 8, y, 6, ROW_H, C_SEL);
             }
         }
     }
@@ -649,10 +737,8 @@ static void text_click(int x, int y) {
     if (v >= g_vcount) v = g_vcount - 1;
     int c = (x - PAD_X) / 8;
     if (c < 0) c = 0;
-    if (c > g_vlen[v]) c = g_vlen[v];
     g_sel_a = -1;
-    g_off = g_vpos[v] + c;
-    if (g_off > g_len) g_off = g_len;
+    g_off = col_to_off(g_vpos[v], c);
     g_need = 1;
 }
 
@@ -685,8 +771,8 @@ static void key_event(u32 c) {
         return;
     }
 
-    if (c == INPUT_KEY_LEFT) move_caret(g_off - 1);
-    else if (c == INPUT_KEY_RIGHT) move_caret(g_off + 1);
+    if (c == INPUT_KEY_LEFT) move_caret(prev_char(g_off));
+    else if (c == INPUT_KEY_RIGHT) move_caret(next_char(g_off));
     else if (c == INPUT_KEY_UP) move_vertical(-1);
     else if (c == INPUT_KEY_DOWN) move_vertical(1);
     else if (c == INPUT_KEY_HOME) move_home();
@@ -719,6 +805,10 @@ static void handle_event(const gui_event_t *ev) {
         if (!released) key_event(code);
         break;
     }
+
+    case GUI_EVT_TEXT:
+        insert_utf8(ev->text);
+        break;
 
     case GUI_EVT_MOUSE:
         if (!(ev->buttons & 1)) break;

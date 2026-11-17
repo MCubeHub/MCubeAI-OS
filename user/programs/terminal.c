@@ -188,6 +188,12 @@ static void handle_event(const gui_event_t *ev) {
     case GUI_EVT_KEY:
         forward_key(ev->code);
         break;
+    case GUI_EVT_TEXT:
+        /* The shell IME committed UTF-8 text. Send it to the shell as if it had
+         * been typed; commands are ASCII, but file names may be Chinese. */
+        if (g_in_fd >= 0 && !g_shell_dead && ev->text[0])
+            write(g_in_fd, ev->text, strlen(ev->text));
+        break;
     case GUI_EVT_RESIZE:
         g_need_redraw = 1;
         break;
