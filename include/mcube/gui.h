@@ -50,6 +50,7 @@
 #define GUI_EVT_FOCUS   4
 #define GUI_EVT_CLOSE   5
 #define GUI_EVT_TICK    6
+#define GUI_EVT_TEXT    7   /* composed text from the system IME, UTF-8 */
 
 /* Modifier state carried in gui_event.buttons for GUI_EVT_KEY. The desktop
  * consumes the standalone modifier press/release events for its own chords,
@@ -76,6 +77,7 @@ typedef struct PACKED gui_event {
     i32 dx, dy;
     u32 buttons;
     u32 w, h;       /* new content size for RESIZE */
+    char text[GUI_TEXT_MAX]; /* UTF-8 payload for GUI_EVT_TEXT */
 } gui_event_t;
 
 /* Client side (user/lib/gui.c). Returns 0 on success. */
