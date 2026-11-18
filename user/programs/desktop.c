@@ -605,11 +605,18 @@ static int utf8_next(const char *s, int n, int i, u32 *cp) {
 }
 
 /* Draw one 16x16 1 bpp glyph. Returns its advance (16 px). Missing glyphs get
- * a hollow box so unimplemented characters are visible instead of invisible. */
+ * a hollow box so unimplemented characters are visible instead of invisible.
+ *
+ * The ideographic ink fills the whole em box (rows 1..15), while the 8x16 Latin
+ * face puts its baseline on row 13. Drawing both at the same top edge made
+ * Chinese hang three pixels below the Latin baseline, which reads as text
+ * bouncing up and down in mixed lines. Lift the CJK bitmap two pixels so its
+ * bottom lands on that baseline. */
 static void gfx_cjk_glyph(u32 *buf, int stride, int bw, int bh,
                           int px, int py, u32 rgb, u32 cp,
                           int cx0, int cy0, int cx1, int cy1) {
     const u8 *g = ime_glyph(cp);
+    py -= 2;
     if (!g) {
         for (int i = 0; i < 16; i++) {
             blend_px(buf, stride, bw, bh, px + i, py, rgb, 160);
